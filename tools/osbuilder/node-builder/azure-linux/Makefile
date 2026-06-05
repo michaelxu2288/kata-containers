@@ -62,6 +62,10 @@ deploy-package-tools:
 deploy-uvm:
 	./uvm_install.sh
 
+.PHONY: deploy-go-preserve-config
+deploy-go-preserve-config:
+	$(MAKE) USE_RUNTIME_RS=no SHIM_REDEPLOY_CONFIG=no all deploy
+
 .PHONY: deploy-confpods
 deploy-confpods: deploy-confpods-package deploy-confpods-uvm
 

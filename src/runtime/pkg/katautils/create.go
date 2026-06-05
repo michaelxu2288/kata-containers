@@ -78,6 +78,12 @@ func HandleFactory(ctx context.Context, vci vc.VC, runtimeConfig *oci.RuntimeCon
 		},
 	}
 
+	kataUtilsLogger.WithField("template", factoryConfig.Template).
+		WithField("template-path", factoryConfig.TemplatePath).
+		WithField("vm-cache", factoryConfig.VMCache).
+		WithField("vm-cache-endpoint", factoryConfig.VMCacheEndpoint).
+		Info("MICHAELX HandleFactory evaluating VM factory config")
+
 	kataUtilsLogger.WithField("factory", factoryConfig).Info("load vm factory")
 
 	f, err := vf.NewFactory(ctx, factoryConfig, true)

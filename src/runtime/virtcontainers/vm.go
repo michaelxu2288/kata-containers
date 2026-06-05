@@ -304,6 +304,7 @@ func (v *VM) OnlineCPUMemory(ctx context.Context) error {
 // ReseedRNG adds random entropy to guest random number generator
 // and reseeds it.
 func (v *VM) ReseedRNG(ctx context.Context) error {
+	v.logger().Info("MICHAELX VM post-restore RNG reseed path")
 	v.logger().Infof("reseed guest random number generator")
 	data := make([]byte, 512)
 	f, err := os.OpenFile(urandomDev, os.O_RDONLY, 0)
@@ -323,6 +324,7 @@ func (v *VM) ReseedRNG(ctx context.Context) error {
 // SyncTime syncs guest time with host time.
 func (v *VM) SyncTime(ctx context.Context) error {
 	now := time.Now()
+	v.logger().WithField("time", now).Info("MICHAELX VM post-restore guest time sync path")
 	v.logger().WithField("time", now).Infof("sync guest time")
 	return v.agent.setGuestDateTime(ctx, now)
 }

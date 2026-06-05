@@ -759,6 +759,12 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 	// Check if we should restore from template instead of creating new VM
 	if clh.config.BootFromTemplate && clh.shouldRestoreFromTemplate() {
 		clh.Logger().Info("Template files found, will restore VM instead of creating new")
+		clh.Logger().WithFields(log.Fields{
+			"memory-path":       clh.config.MemoryPath,
+			"device-state-path": clh.config.DevicesStatePath,
+			"vm-store-path":     clh.config.VMStorePath,
+			"run-store-path":    clh.config.RunStorePath,
+		}).Info("MICHAELX Cloud Hypervisor restore path selected")
 		// Mark this as a restore operation for StartVM to use RestoreVM instead
 		clh.state.isRestoring = true
 		return nil
@@ -1556,6 +1562,7 @@ func (clh *cloudHypervisor) SaveVM() error {
 
 func (clh *cloudHypervisor) ResumeVM(ctx context.Context) error {
 	clh.Logger().WithField("function", "ResumeVM").Info("Resume Sandbox")
+	clh.Logger().WithField("function", "ResumeVM").Info("MICHAELX Cloud Hypervisor resume called")
 	cl := clh.client()
 	ctx, cancel := context.WithTimeout(ctx, clh.getClhAPITimeout()*time.Second)
 	defer cancel()
@@ -2026,6 +2033,13 @@ func (clh *cloudHypervisor) restoreVM(ctx context.Context) error {
 	// which contain the VM state and configuration respectively
 	stateFile := filepath.Join(vmPath, "state.json")
 	configFile := filepath.Join(vmPath, "config.json")
+
+	clh.Logger().WithFields(log.Fields{
+		"source-url":  sourceURL,
+		"vm-path":     vmPath,
+		"state-file":  stateFile,
+		"config-file": configFile,
+	}).Info("MICHAELX Cloud Hypervisor restoreVM using template snapshot")
 
 	if _, err := os.Stat(stateFile); err != nil {
 		return fmt.Errorf("Failed to access state file %s: %v", stateFile, err)

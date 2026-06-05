@@ -40,6 +40,13 @@ func NewFactory(ctx context.Context, config Config, fetchOnly bool) (vc.Factory,
 
 	var b base.FactoryBase
 	if config.VMCache && config.Cache == 0 {
+		factoryLogger.WithField("subsystem", "factory").
+			WithField("template", config.Template).
+			WithField("template-path", config.TemplatePath).
+			WithField("vm-cache", config.VMCache).
+			WithField("fetch-only", fetchOnly).
+			Info("MICHAELX NewFactory using VM cache factory path")
+
 		// For VMCache client
 		b, err = grpccache.New(ctx, config.VMCacheEndpoint)
 		if err != nil {
@@ -47,12 +54,25 @@ func NewFactory(ctx context.Context, config Config, fetchOnly bool) (vc.Factory,
 		}
 	} else {
 		if config.Template {
+			factoryLogger.WithField("subsystem", "factory").
+				WithField("template-path", config.TemplatePath).
+				WithField("fetch-only", fetchOnly).
+				Info("MICHAELX NewFactory using VM template factory path")
+
 			if fetchOnly {
+				factoryLogger.WithField("subsystem", "factory").
+					WithField("template-path", config.TemplatePath).
+					Info("MICHAELX fetching existing VM template factory")
+
 				b, err = template.Fetch(config.VMConfig, config.TemplatePath)
 				if err != nil {
 					return nil, err
 				}
 			} else {
+				factoryLogger.WithField("subsystem", "factory").
+					WithField("template-path", config.TemplatePath).
+					Info("MICHAELX creating new VM template factory")
+
 				b, err = template.New(ctx, config.VMConfig, config.TemplatePath)
 				if err != nil {
 					return nil, err
@@ -126,6 +146,13 @@ func (f *factory) GetVM(ctx context.Context, config vc.VMConfig) (*vc.VM, error)
 	}
 
 	f.log().Info("get base VM")
+	f.log().WithField("boot-from-template", hypervisorConfig.BootFromTemplate).
+		WithField("boot-to-be-template", hypervisorConfig.BootToBeTemplate).
+		WithField("template-memory-path", hypervisorConfig.MemoryPath).
+		WithField("template-device-state-path", hypervisorConfig.DevicesStatePath).
+		WithField("vm-store-path", hypervisorConfig.VMStorePath).
+		Info("MICHAELX factory GetVM requesting base VM")
+
 	vm, err := f.base.GetBaseVM(ctx, config)
 	if err != nil {
 		f.log().WithError(err).Error("failed to get base VM")
@@ -144,18 +171,21 @@ func (f *factory) GetVM(ctx context.Context, config vc.VMConfig) (*vc.VM, error)
 	if err != nil {
 		return nil, err
 	}
+	f.log().Info("MICHAELX factory resumed base VM")
 
 	// reseed RNG so that shared memory VMs do not generate same random numbers.
 	err = vm.ReseedRNG(ctx)
 	if err != nil {
 		return nil, err
 	}
+	f.log().Info("MICHAELX factory reseeded guest RNG after VM restore")
 
 	// sync guest time since we might have paused it for a long time.
 	err = vm.SyncTime(ctx)
 	if err != nil {
 		return nil, err
 	}
+	f.log().Info("MICHAELX factory synced guest time after VM restore")
 
 	online := false
 	baseConfig := f.base.Config().HypervisorConfig

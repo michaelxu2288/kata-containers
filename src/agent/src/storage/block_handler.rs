@@ -98,6 +98,7 @@ impl StorageHandler for VirtioBlkPciHandler {
 
 #[cfg(target_arch = "s390x")]
 #[derive(Debug)]
+#[cfg_attr(not(target_arch = "s390x"), allow(dead_code))]
 pub struct VirtioBlkCcwHandler {}
 
 #[cfg(target_arch = "s390x")]

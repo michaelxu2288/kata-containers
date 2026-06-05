@@ -1601,6 +1601,8 @@ func LoadConfiguration(configPath string, ignoreLogging bool) (resolvedConfigPat
 			return "", config, err
 		}
 
+		kataUtilsLogger.WithField("marker", "michaelx-local-build").Info("MICHAELX hello world at beginning of Kata log")
+
 		kataUtilsLogger.WithFields(
 			logrus.Fields{
 				"format": "TOML",

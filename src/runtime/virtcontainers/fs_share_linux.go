@@ -653,7 +653,15 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 		return f.shareRootFilesystemWithNydus(ctx, c)
 	}
 
-	if IsErofsRootFS(c.rootFs) {
+	isErofsRootFS := IsErofsRootFS(c.rootFs)
+	c.Logger().WithFields(logrus.Fields{
+		"rootfs-type":     c.rootFs.Type,
+		"rootfs-source":   c.rootFs.Source,
+		"rootfs-options":  c.rootFs.Options,
+		"is-erofs-rootfs": isErofsRootFS,
+	}).Warn("MICHAELX IsErofsRootFS rootfs check")
+
+	if isErofsRootFS {
 		return f.shareRootFilesystemWithErofs(ctx, c)
 	}
 

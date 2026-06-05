@@ -30,6 +30,10 @@ var templateWaitForAgent = 2 * time.Second
 // Fetch finds and returns a pre-built template factory.
 // TODO: save template metadata and fetch from storage.
 func Fetch(config vc.VMConfig, templatePath string) (base.FactoryBase, error) {
+	templateLog.WithField("template-path", templatePath).
+		WithField("hypervisor-type", config.HypervisorType).
+		Info("MICHAELX fetching existing VM template")
+
 	t := &template{templatePath, config}
 
 	err := t.checkTemplateVM()
@@ -42,6 +46,10 @@ func Fetch(config vc.VMConfig, templatePath string) (base.FactoryBase, error) {
 
 // New creates a new VM template factory.
 func New(ctx context.Context, config vc.VMConfig, templatePath string) (base.FactoryBase, error) {
+	templateLog.WithField("template-path", templatePath).
+		WithField("hypervisor-type", config.HypervisorType).
+		Info("MICHAELX creating new VM template")
+
 	t := &template{templatePath, config}
 
 	err := t.checkTemplateVM()
@@ -109,6 +117,10 @@ func (t *template) prepareTemplateFiles() error {
 		t.close()
 		return err
 	}
+	t.Logger().WithField("template-path", t.statePath).
+		WithField("tmpfs-options", opts).
+		Info("MICHAELX mounted tmpfs for VM template files")
+
 	f, err := os.Create(t.statePath + "/memory")
 	if err != nil {
 		t.close()
@@ -137,6 +149,13 @@ func (t *template) createTemplateVM(ctx context.Context) error {
 	config.HypervisorConfig.DevicesStatePath = t.deviceStatePath()
 	config.HypervisorConfig.VMStorePath = t.statePath
 
+	t.Logger().WithField("memory-path", config.HypervisorConfig.MemoryPath).
+		WithField("device-state-path", config.HypervisorConfig.DevicesStatePath).
+		WithField("vm-store-path", config.HypervisorConfig.VMStorePath).
+		WithField("boot-to-be-template", config.HypervisorConfig.BootToBeTemplate).
+		WithField("boot-from-template", config.HypervisorConfig.BootFromTemplate).
+		Info("MICHAELX booting VM to create template")
+
 	vm, err := vc.NewVM(ctx, config)
 	if err != nil {
 		return err
@@ -164,6 +183,11 @@ func (t *template) createTemplateVM(ctx context.Context) error {
 		return err
 	}
 
+	t.Logger().WithField("memory-path", config.HypervisorConfig.MemoryPath).
+		WithField("device-state-path", config.HypervisorConfig.DevicesStatePath).
+		WithField("vm-store-path", config.HypervisorConfig.VMStorePath).
+		Info("MICHAELX saved VM template snapshot")
+
 	return nil
 }
 
@@ -176,6 +200,14 @@ func (t *template) createFromTemplateVM(ctx context.Context, c vc.VMConfig) (*vc
 	config.HypervisorConfig.SharedPath = c.HypervisorConfig.SharedPath
 	config.HypervisorConfig.VMStorePath = c.HypervisorConfig.VMStorePath
 	config.HypervisorConfig.RunStorePath = c.HypervisorConfig.RunStorePath
+
+	t.Logger().WithField("memory-path", config.HypervisorConfig.MemoryPath).
+		WithField("device-state-path", config.HypervisorConfig.DevicesStatePath).
+		WithField("shared-path", config.HypervisorConfig.SharedPath).
+		WithField("vm-store-path", config.HypervisorConfig.VMStorePath).
+		WithField("run-store-path", config.HypervisorConfig.RunStorePath).
+		WithField("boot-from-template", config.HypervisorConfig.BootFromTemplate).
+		Info("MICHAELX creating VM from template")
 
 	return vc.NewVM(ctx, config)
 }

@@ -83,6 +83,14 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		rootFs.Options = m.Options
 	}
 
+	shimLog.WithFields(logrus.Fields{
+		"request-id":           r.ID,
+		"request-rootfs-count": len(r.Rootfs),
+		"rootfs-source":        rootFs.Source,
+		"rootfs-type":          rootFs.Type,
+		"rootfs-options":       rootFs.Options,
+	}).Warn("MICHAELX create initial rootfs")
+
 	detach := !r.Terminal
 	ociSpec, bundlePath, err := loadSpec(r)
 
@@ -98,6 +106,15 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 	if err != nil {
 		return nil, err
 	}
+
+	shimLog.WithFields(logrus.Fields{
+		"request-id":           r.ID,
+		"container-type":       containerType,
+		"request-rootfs-count": len(r.Rootfs),
+		"rootfs-source":        rootFs.Source,
+		"rootfs-type":          rootFs.Type,
+		"rootfs-options":       rootFs.Options,
+	}).Warn("MICHAELX create rootfs after container type")
 
 	disableOutput := noNeedForOutput(detach, ociSpec.Process.Terminal)
 	rootfs := filepath.Join(r.Bundle, "rootfs")
@@ -161,6 +178,16 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 			return nil, err
 		}
 
+		shimLog.WithFields(logrus.Fields{
+			"request-id":           r.ID,
+			"container-type":       containerType,
+			"request-rootfs-count": len(r.Rootfs),
+			"rootfs-mounted":       rootFs.Mounted,
+			"rootfs-source":        rootFs.Source,
+			"rootfs-type":          rootFs.Type,
+			"rootfs-options":       rootFs.Options,
+		}).Warn("MICHAELX create rootfs before CreateSandbox")
+
 		defer func() {
 			if err != nil && rootFs.Mounted {
 				if err2 := mount.UnmountAll(rootfs, 0); err2 != nil {
@@ -168,6 +195,14 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 				}
 			}
 		}()
+
+		shimLog.WithFields(logrus.Fields{
+			"container-type":  containerType,
+			"template":        s.config.FactoryConfig.Template,
+			"template-path":   s.config.FactoryConfig.TemplatePath,
+			"vm-cache-number": s.config.FactoryConfig.VMCacheNumber,
+			"hypervisor-type": s.config.HypervisorType,
+		}).Info("MICHAELX kata shim create before HandleFactory")
 
 		katautils.HandleFactory(ctx, vci, s.config)
 		rootless.SetRootless(s.config.HypervisorConfig.Rootless)
@@ -214,6 +249,16 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		if rootFs.Mounted, err = checkAndMount(s, r); err != nil {
 			return nil, err
 		}
+
+		shimLog.WithFields(logrus.Fields{
+			"request-id":           r.ID,
+			"container-type":       containerType,
+			"request-rootfs-count": len(r.Rootfs),
+			"rootfs-mounted":       rootFs.Mounted,
+			"rootfs-source":        rootFs.Source,
+			"rootfs-type":          rootFs.Type,
+			"rootfs-options":       rootFs.Options,
+		}).Warn("MICHAELX create rootfs before CreateContainer")
 
 		defer func() {
 			if err != nil && rootFs.Mounted {
