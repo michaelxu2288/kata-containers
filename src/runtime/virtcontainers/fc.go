@@ -905,6 +905,10 @@ func (fc *firecracker) SaveVM() error {
 	return nil
 }
 
+func (fc *firecracker) SaveVMTo(destDir string) error {
+	return notImplemented("SaveVMTo")
+}
+
 func (fc *firecracker) ResumeVM(ctx context.Context) error {
 	return nil
 }

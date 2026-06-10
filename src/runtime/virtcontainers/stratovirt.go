@@ -1115,6 +1115,10 @@ func (s *stratovirt) SaveVM() error {
 	return nil
 }
 
+func (s *stratovirt) SaveVMTo(destDir string) error {
+	return notImplemented("SaveVMTo")
+}
+
 func (s *stratovirt) ResumeVM(ctx context.Context) error {
 	return nil
 }

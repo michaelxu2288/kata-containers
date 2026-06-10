@@ -42,6 +42,10 @@ func (vfw *virtFramework) SaveVM() error {
 	return nil
 }
 
+func (vfw *virtFramework) SaveVMTo(destDir string) error {
+	return notImplemented("SaveVMTo")
+}
+
 func (vfw *virtFramework) ResumeVM(ctx context.Context) error {
 	return nil
 }
