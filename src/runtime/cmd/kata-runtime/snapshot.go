@@ -7,6 +7,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
 	containerdshim "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils"
@@ -14,53 +16,100 @@ import (
 	"github.com/urfave/cli"
 )
 
+// snapshotBaseDir mirrors the shim-side default location for snapshot dirs.
+const snapshotBaseDir = "/run/vc/vm/snapshots"
+
 var snapshotSubCmds = []cli.Command{
-	saveSnapshotCommand,
+	deleteSnapshotCommand,
 }
 
 var snapshotCLICommand = cli.Command{
-	Name:        "snapshot",
-	Usage:       "snapshot a running Kata Containers sandbox VM",
-	Subcommands: snapshotSubCmds,
-	Action: func(context *cli.Context) {
-		cli.ShowSubcommandHelp(context)
-	},
-}
-
-var saveSnapshotCommand = cli.Command{
-	Name:      "save",
-	Usage:     "save a snapshot of the sandbox VM to a destination directory",
-	ArgsUsage: "[destination-directory]",
+	Name:  "snapshot",
+	Usage: "snapshot a running Kata Containers sandbox VM",
 	Flags: []cli.Flag{
 		cli.StringFlag{
 			Name:        "sandbox-id",
-			Usage:       "the target sandbox for the snapshot",
-			Required:    true,
+			Usage:       "the target sandbox to snapshot",
 			Destination: &sandboxID,
 		},
+		cli.StringFlag{
+			Name:  "name",
+			Usage: "name the snapshot directory (default: the sandbox id)",
+		},
 	},
+	// delete is a subcommand; with no matching subcommand this Action runs.
+	Subcommands: snapshotSubCmds,
 	Action: func(c *cli.Context) error {
-		// optional positional arg: where to write the snapshot. empty -> shim default.
-		destDir := c.Args().Get(0)
-
-		// verify sandbox exists:
+		// sandbox-id is required for the take-snapshot action. it is NOT marked
+		// Required on the flag because that check would also fire on the
+		// `snapshot delete` subcommand path (cli v1 validates parent flags
+		// before dispatching), so we enforce it here instead.
+		if sandboxID == "" {
+			return fmt.Errorf("--sandbox-id is required")
+		}
 		if err := katautils.VerifyContainerID(sandboxID); err != nil {
 			return err
 		}
 
-		// the shim does the pause/save/snapshot/resume work; we just send the
-		// destination dir as the request body and print back the path it used.
-		url := containerdshim.SnapshotUrl
+		// the snapshot always lives under snapshotBaseDir. --name only changes
+		// the leaf directory name; empty lets the shim default to <base>/<sbid>.
+		var destDir string
+		if name := c.String("name"); name != "" {
+			destDir = filepath.Join(snapshotBaseDir, name)
+		}
 
-		if err := shimclient.DoPut(sandboxID, defaultTimeout, url, "application/octet-stream", []byte(destDir)); err != nil {
+		// the shim does the pause/save/snapshot/resume work; we send the
+		// destination dir as the request body and print the path it used.
+		if err := shimclient.DoPut(sandboxID, defaultTimeout, containerdshim.SnapshotUrl,
+			"application/octet-stream", []byte(destDir)); err != nil {
 			return fmt.Errorf("Error observed when making snapshot request: %s", err)
 		}
 
 		out := destDir
 		if out == "" {
-			out = fmt.Sprintf("/run/vc/vm/snapshots/%s", sandboxID)
+			out = filepath.Join(snapshotBaseDir, sandboxID)
 		}
 		fmt.Fprintln(defaultOutputFile, out)
+
+		return nil
+	},
+}
+
+var deleteSnapshotCommand = cli.Command{
+	Name:  "delete",
+	Usage: "delete a snapshot directory by sandbox id or name",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:        "sandbox-id",
+			Usage:       "delete the snapshot taken for this sandbox id",
+			Destination: &sandboxID,
+		},
+		cli.StringFlag{
+			Name:  "name",
+			Usage: "delete the snapshot with this name",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		name := c.String("name")
+
+		// exactly one selector is required.
+		if (sandboxID == "") == (name == "") {
+			return fmt.Errorf("specify exactly one of --sandbox-id or --name")
+		}
+
+		target := sandboxID
+		if name != "" {
+			target = name
+		}
+
+		// delete is a node-local directory removal; a snapshot can outlive its
+		// sandbox, so there is no shim round-trip.
+		dir := filepath.Join(snapshotBaseDir, target)
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("failed to delete snapshot %s: %s", dir, err)
+		}
+
+		fmt.Fprintln(defaultOutputFile, dir)
 
 		return nil
 	},
