@@ -9,12 +9,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	containerdshim "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/utils/shimclient"
 	"github.com/urfave/cli"
 )
+
+// snapshotTimeout is the whole-request deadline for the snapshot PUT. A snapshot
+// copies the full guest RAM to a fresh directory (O(N) in VM size, ~1s/GiB), so
+// it must comfortably exceed the shim-side getClhSnapshotTimeout (max(30s,10s/GiB))
+// plus pause/resume headroom. The default 3s exec timeout would abort mid-dump
+// and orphan a partial RAM file. A generous fixed ceiling avoids needing the
+// guest MemorySize client-side.
+const snapshotTimeout = 300 * time.Second
 
 var snapshotSubCmds = []cli.Command{
 	deleteSnapshotCommand,
@@ -57,7 +66,7 @@ var snapshotCLICommand = cli.Command{
 
 		// the shim does the pause/save/snapshot/resume work; we send the
 		// destination dir as the request body and print the path it used.
-		if err := shimclient.DoPut(sandboxID, defaultTimeout, containerdshim.SnapshotUrl,
+		if err := shimclient.DoPut(sandboxID, snapshotTimeout, containerdshim.SnapshotUrl,
 			"application/octet-stream", []byte(destDir)); err != nil {
 			return fmt.Errorf("Error observed when making snapshot request: %s", err)
 		}
@@ -101,7 +110,12 @@ var deleteSnapshotCommand = cli.Command{
 
 		// delete is a node-local directory removal; a snapshot can outlive its
 		// sandbox, so there is no shim round-trip.
-		dir := filepath.Join(containerdshim.SnapshotBaseDir, target)
+		// reject path-traversal in the selector: the resolved dir must stay a
+		// direct child of SnapshotBaseDir (e.g. --name ../../etc must not escape).
+		dir := filepath.Clean(filepath.Join(containerdshim.SnapshotBaseDir, target))
+		if filepath.Dir(dir) != filepath.Clean(containerdshim.SnapshotBaseDir) {
+			return fmt.Errorf("invalid snapshot selector %q: must not contain path separators or ..", target)
+		}
 		if err := os.RemoveAll(dir); err != nil {
 			return fmt.Errorf("failed to delete snapshot %s: %s", dir, err)
 		}

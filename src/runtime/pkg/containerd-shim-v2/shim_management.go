@@ -432,7 +432,9 @@ func (s *service) doSnapshot(ctx context.Context, destDir string) error {
 	if err := s.sandbox.SaveVM(destDir); err != nil {
 		return err
 	}
-	// bundle the persist.json into the snapshot dir so it is self-contained.
+	// bundle the persist.json into the snapshot dir alongside the memory/state
+	// files. note: config.json's memory zone .file still references the source
+	// memory path (rewriting it for a portable snapshot is restore-side work).
 	if err := s.copyPersistInto(destDir); err != nil {
 		return err
 	}
