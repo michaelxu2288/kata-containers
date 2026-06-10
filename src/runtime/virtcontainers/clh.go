@@ -1506,9 +1506,7 @@ func (clh *cloudHypervisor) SaveVMTo(destDir string) error {
 	defer cancel()
 
 	snapshotDir := destDir
-	// Create snapshot config with file URL to template path
-	// Use MemoryPath as base for snapshot destination
-	// When creating a template, the MemoryPath is set to the template path, so we can use it to save the snapshot.
+	// cloud-hypervisor writes the snapshot files into this destination dir.
 	fileURL := "file://" + snapshotDir
 
 	vmSnapshotConfig := *chclient.NewVmSnapshotConfig()

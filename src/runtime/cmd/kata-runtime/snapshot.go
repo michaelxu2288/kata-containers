@@ -16,9 +16,6 @@ import (
 	"github.com/urfave/cli"
 )
 
-// snapshotBaseDir mirrors the shim-side default location for snapshot dirs.
-const snapshotBaseDir = "/run/vc/vm/snapshots"
-
 var snapshotSubCmds = []cli.Command{
 	deleteSnapshotCommand,
 }
@@ -51,11 +48,11 @@ var snapshotCLICommand = cli.Command{
 			return err
 		}
 
-		// the snapshot always lives under snapshotBaseDir. --name only changes
+		// the snapshot always lives under SnapshotBaseDir. --name only changes
 		// the leaf directory name; empty lets the shim default to <base>/<sbid>.
 		var destDir string
 		if name := c.String("name"); name != "" {
-			destDir = filepath.Join(snapshotBaseDir, name)
+			destDir = filepath.Join(containerdshim.SnapshotBaseDir, name)
 		}
 
 		// the shim does the pause/save/snapshot/resume work; we send the
@@ -67,7 +64,7 @@ var snapshotCLICommand = cli.Command{
 
 		out := destDir
 		if out == "" {
-			out = filepath.Join(snapshotBaseDir, sandboxID)
+			out = filepath.Join(containerdshim.SnapshotBaseDir, sandboxID)
 		}
 		fmt.Fprintln(defaultOutputFile, out)
 
@@ -104,7 +101,7 @@ var deleteSnapshotCommand = cli.Command{
 
 		// delete is a node-local directory removal; a snapshot can outlive its
 		// sandbox, so there is no shim round-trip.
-		dir := filepath.Join(snapshotBaseDir, target)
+		dir := filepath.Join(containerdshim.SnapshotBaseDir, target)
 		if err := os.RemoveAll(dir); err != nil {
 			return fmt.Errorf("failed to delete snapshot %s: %s", dir, err)
 		}
