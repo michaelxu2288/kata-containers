@@ -365,8 +365,9 @@ func ServerSocketAddress(id string) string {
 	return fmt.Sprintf("unix://%s", SocketPathGo(id))
 }
 
-// snapshotBaseDir is where kata-runtime snapshot dirs live by default.
-const snapshotBaseDir = "/run/vc/vm/snapshots"
+// SnapshotBaseDir is where kata-runtime snapshot dirs live by default. It is
+// the canonical default shared by the shim handler and the kata-runtime CLI.
+const SnapshotBaseDir = "/run/vc/vm/snapshots"
 
 // snapshotManifest is the small self-describing record we drop alongside the
 // cloud-hypervisor snapshot files so a future restore can identify the source.
@@ -377,7 +378,7 @@ type snapshotManifest struct {
 
 // snapshotHandler triggers a VM snapshot of the sandbox over the management socket.
 // the request body, when non-empty, is the destination directory; otherwise we
-// default to snapshotBaseDir/<sandbox-id>.
+// default to SnapshotBaseDir/<sandbox-id>.
 func (s *service) snapshotHandler(w http.ResponseWriter, r *http.Request) {
 	logger := shimMgtLog.WithFields(logrus.Fields{"handler": "snapshot"})
 
@@ -392,7 +393,7 @@ func (s *service) snapshotHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		destDir := strings.TrimSpace(string(body))
 		if destDir == "" {
-			destDir = filepath.Join(snapshotBaseDir, s.id)
+			destDir = filepath.Join(SnapshotBaseDir, s.id)
 		}
 
 		if err := s.doSnapshot(context.Background(), destDir); err != nil {
