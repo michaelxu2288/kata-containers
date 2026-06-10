@@ -80,6 +80,11 @@ const (
 	// Minimum timout for calling CreateVM followed by BootVM. Executing these two APIs
 	// might take longer than the value returned by getClhAPITimeout().
 	clhCreateAndBootVMMinimumTimeout = 10
+	// Minimum timeout for a VM snapshot. Writing the guest RAM to disk scales with
+	// memory size and easily exceeds the 1s default API timeout (a 2 GiB save takes ~2s).
+	clhSnapshotMinimumTimeout = 30
+	// Extra snapshot seconds to allow per GiB of guest memory written to disk.
+	clhSnapshotTimeoutPerGiB = 10
 	// Timeout for hot-plug - hotplug devices can take more time, than usual API calls
 	// Use longer time timeout for it.
 	clhHotPlugAPITimeout                   = 5
@@ -334,6 +339,20 @@ var clhDebugKernelParamsCommon = []Param{
 // hypervisor interface implementation for cloud-hypervisor
 //
 //###########################################################
+
+// getClhSnapshotTimeout returns a deadline for the vm.snapshot API call. The
+// snapshot writes the entire guest RAM to disk, so the deadline scales with
+// memory size and is floored well above the 1s default API timeout.
+func (clh *cloudHypervisor) getClhSnapshotTimeout() time.Duration {
+	timeout := time.Duration(clhSnapshotMinimumTimeout) * time.Second
+	// MemorySize is in MiB; add headroom per GiB of guest memory.
+	memGiB := clh.config.MemorySize / 1024
+	sized := time.Duration(memGiB) * time.Duration(clhSnapshotTimeoutPerGiB) * time.Second
+	if sized > timeout {
+		timeout = sized
+	}
+	return timeout
+}
 
 func (clh *cloudHypervisor) getClhAPITimeout() time.Duration {
 	// Increase the APITimeout when dealing with a Confidential Guest.
@@ -1485,14 +1504,14 @@ func (clh *cloudHypervisor) PauseVM(ctx context.Context) error {
 	return nil
 }
 
-func (clh *cloudHypervisor) SaveVM() error {
-	clh.Logger().WithField("function", "SaveVM").Info("Save Sandbox")
+func (clh *cloudHypervisor) SaveVMTo(destDir string) error {
+	clh.Logger().WithField("function", "SaveVMTo").Info("Save Sandbox")
 
 	cl := clh.client()
-	ctx, cancel := context.WithTimeout(context.Background(), clh.getClhAPITimeout()*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), clh.getClhSnapshotTimeout())
 	defer cancel()
 
-	snapshotDir := filepath.Dir(clh.config.MemoryPath)
+	snapshotDir := destDir
 	// Create snapshot config with file URL to template path
 	// Use MemoryPath as base for snapshot destination
 	// When creating a template, the MemoryPath is set to the template path, so we can use it to save the snapshot.
@@ -1558,6 +1577,10 @@ func (clh *cloudHypervisor) SaveVM() error {
 	}
 
 	return nil
+}
+
+func (clh *cloudHypervisor) SaveVM() error {
+	return clh.SaveVMTo(filepath.Dir(clh.config.MemoryPath))
 }
 
 func (clh *cloudHypervisor) ResumeVM(ctx context.Context) error {

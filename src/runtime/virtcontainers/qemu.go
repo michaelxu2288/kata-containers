@@ -2400,6 +2400,10 @@ func (q *qemu) SaveVM() error {
 	return q.waitMigration()
 }
 
+func (q *qemu) SaveVMTo(destDir string) error {
+	return notImplemented("SaveVMTo")
+}
+
 func (q *qemu) waitMigration() error {
 	t := time.NewTimer(qmpMigrationWaitTimeout)
 	defer t.Stop()

@@ -1292,6 +1292,7 @@ type Hypervisor interface {
 	StopVM(ctx context.Context, waitOnly bool) error
 	PauseVM(ctx context.Context) error
 	SaveVM() error
+	SaveVMTo(destDir string) error
 	ResumeVM(ctx context.Context) error
 	AddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) error
 	HotplugAddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error)
