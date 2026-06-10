@@ -429,7 +429,7 @@ func (s *service) doSnapshot(ctx context.Context, destDir string) error {
 		return err
 	}
 	// snapshot the VM memory + device state into destDir via cloud-hypervisor.
-	if err := s.sandbox.SaveVMTo(destDir); err != nil {
+	if err := s.sandbox.SaveVM(destDir); err != nil {
 		return err
 	}
 	// bundle the persist.json into the snapshot dir so it is self-contained.

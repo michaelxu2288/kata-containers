@@ -279,8 +279,8 @@ func (s *Sandbox) PauseVM(ctx context.Context) error {
 	return nil
 }
 
-// SaveVMTo implements the VCSandbox function of the same name.
-func (s *Sandbox) SaveVMTo(destDir string) error {
+// SaveVM implements the VCSandbox function of the same name.
+func (s *Sandbox) SaveVM(destDir string) error {
 	return nil
 }
 

@@ -1864,8 +1864,8 @@ func (s *Sandbox) PauseVM(ctx context.Context) error {
 	return s.hypervisor.PauseVM(ctx)
 }
 
-// SaveVMTo saves the sandbox's VM state to the given destination directory.
-func (s *Sandbox) SaveVMTo(destDir string) error {
+// SaveVM saves the sandbox's VM state to the given destination directory.
+func (s *Sandbox) SaveVM(destDir string) error {
 	s.Logger().Info("save vm to dir")
 	return s.hypervisor.SaveVM(destDir)
 }
