@@ -432,13 +432,61 @@ func (s *service) doSnapshot(ctx context.Context, destDir string) error {
 	if err := s.sandbox.SaveVM(destDir); err != nil {
 		return err
 	}
-	// bundle the persist.json into the snapshot dir alongside the memory/state
-	// files. note: config.json's memory zone .file still references the source
-	// memory path (rewriting it for a portable snapshot is restore-side work).
+	// repoint config.json's memory zone file at the in-dir memory-ranges so the
+	// snapshot is self-contained for memory (the source path it inherits is the
+	// shared template/source memory, outside this dir). without this, a restore
+	// that reads config.json mmaps the wrong file (or fails if it is gone).
+	if err := makeConfigSelfContained(destDir); err != nil {
+		return err
+	}
+	// bundle the persist.json into the snapshot dir alongside the memory/state files.
 	if err := s.copyPersistInto(destDir); err != nil {
 		return err
 	}
 	return s.writeSnapshotManifest(destDir)
+}
+
+// makeConfigSelfContained rewrites config.json's memory zone backing-file paths
+// to point at the memory-ranges file inside destDir. cloud-hypervisor writes the
+// snapshot's config.json from the live VmConfig, whose memory.zones[].file still
+// names the source memory path (e.g. /run/vc/vm/template/memory) outside destDir.
+// On restore CLH opens that path to back the memory zone, so a relocated snapshot
+// (or a GC'd source) would fail. Pointing it at the in-dir memory-ranges makes the
+// snapshot dir's memory self-contained. (Disks are not rewritten here; that is
+// separate, larger work for cross-host portability.)
+func makeConfigSelfContained(destDir string) error {
+	configPath := filepath.Join(destDir, "config.json")
+	memoryRanges := filepath.Join(destDir, "memory-ranges")
+	if _, err := os.Stat(memoryRanges); err != nil {
+		// no memory-ranges file: nothing to repoint, leave config as-is.
+		return nil
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return err
+	}
+	mem, ok := cfg["memory"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	zones, ok := mem["zones"].([]interface{})
+	if !ok {
+		return nil
+	}
+	for _, z := range zones {
+		if zm, ok := z.(map[string]interface{}); ok {
+			zm["file"] = memoryRanges
+		}
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, out, 0600)
 }
 
 // copyPersistInto copies /run/vc/sbs/<id>/persist.json into destDir.
