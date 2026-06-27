@@ -53,5 +53,31 @@ func main() {
 		handleInfoFlag()
 	}
 
+	// restore mode: if launched with a snapshot dir, skip the normal containerd-driven
+	// shim loop and instead restore a managed sandbox, serve its management API, and run
+	// long-lived. triggered by the KATA_RESTORE_FROM env var or a --restore-from flag.
+	if restoreFrom := restoreFromArg(); restoreFrom != "" {
+		if err := shim.RunRestore(restoreFrom); err != nil {
+			fmt.Fprintf(os.Stderr, "restore failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	shimapi.Run(types.DefaultKataRuntimeName, shim.New, shimConfig)
+}
+
+// restoreFromArg returns the snapshot dir to restore from, or "" for normal shim mode.
+// Accepts either the KATA_RESTORE_FROM env var or a `--restore-from <dir>` flag.
+func restoreFromArg() string {
+	if v := os.Getenv("KATA_RESTORE_FROM"); v != "" {
+		return v
+	}
+	args := os.Args[1:]
+	for i, a := range args {
+		if a == "--restore-from" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
 }
