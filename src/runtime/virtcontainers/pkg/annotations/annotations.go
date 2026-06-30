@@ -43,6 +43,12 @@ const (
 	// HypervisorPath is a sandbox annotation for passing a per container path pointing at the hypervisor that will run the container VM.
 	HypervisorPath = kataAnnotHypervisorPrefix + "path"
 
+	// RestoreFrom is a sandbox annotation whose value is a snapshot name or dir; when present,
+	// the shim restores the pod sandbox from that snapshot instead of booting a fresh VM.
+	// hypervisor-mutating (selects the guest memory image), so it will be gated via
+	// enable_annotations once restore dispatch is wired.
+	RestoreFrom = kataAnnotHypervisorPrefix + "restore_from"
+
 	// JailerPath is a sandbox annotation for passing a per container path pointing at the jailer that will constrain the container VM.
 	JailerPath = kataAnnotHypervisorPrefix + "jailer_path"
 

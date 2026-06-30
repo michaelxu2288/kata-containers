@@ -86,17 +86,18 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		sandboxConfig.HypervisorConfig.ImagePath = opts.ImagePath
 	}
 
-	// map the rebuilt config's guest memory MAP_PRIVATE. belt-and-suspenders: RestoreVM
-	// actually hands CLH the snapshot's own config.json, so the patch below is the real COW
-	// guarantee, not this field.
-	sandboxConfig.HypervisorConfig.FileBackedMemory = &FileBackedMemoryConfig{
-		Path:   filepath.Join(snapshotDir, "memory-ranges"),
-		Shared: false,
-	}
-	// mark the snapshot's in-dir config.json memory private (the file CLH actually opens);
-	// without it the clone could write the source's RAM.
-	if err := PatchCLHSnapshotMemoryPrivate(snapshotDir); err != nil {
-		return nil, fmt.Errorf("patch snapshot memory private: %w", err)
+	// map the rebuilt config's guest memory MAP_PRIVATE (COW). CLH-specific: the snapshot is a
+	// CLH memory-ranges dump + config.json, so both the file-backed mapping and the in-dir
+	// config.json private-patch only make sense for cloud-hypervisor. gate both so a non-CLH
+	// restore does not mmap a foreign CLH RAM dump or mis-patch a foreign config.
+	if sandboxConfig.HypervisorType == ClhHypervisor {
+		sandboxConfig.HypervisorConfig.FileBackedMemory = &FileBackedMemoryConfig{
+			Path:   filepath.Join(snapshotDir, "memory-ranges"),
+			Shared: false,
+		}
+		if err := PatchCLHSnapshotMemoryPrivate(snapshotDir); err != nil {
+			return nil, fmt.Errorf("patch snapshot memory private: %w", err)
+		}
 	}
 
 	// build the Sandbox shell. with persist seeded, createSandbox early-returns a
