@@ -94,7 +94,7 @@ func RunRestore(snapshotDir string) error {
 // symlink planted inside the base dir cannot escape it (TOCTOU), then verified to be a real
 // snapshot dir (has config.json). lives here, not in the CLI, so the shim restore dispatch
 // can reuse it.
-func ResolveRestoreSource(from string) (string, error) {
+func ResolveRestoreSource(from string, confineToBase bool) (string, error) {
 	if from == "" {
 		return "", fmt.Errorf("restore source is required")
 	}
@@ -123,6 +123,15 @@ func ResolveRestoreSource(from string) (string, error) {
 	}
 	if _, err := os.Stat(filepath.Join(resolved, "config.json")); err != nil {
 		return "", fmt.Errorf("not a snapshot dir (no config.json): %s", resolved)
+	}
+	// when the source is untrusted-ish (annotation-driven restore), confine ANY input -- path
+	// or name -- to SnapshotBaseDir; the CLI passes false since a root operator may name an
+	// explicit path.
+	if confineToBase {
+		base := filepath.Clean(SnapshotBaseDir)
+		if resolved != base && !strings.HasPrefix(resolved, base+string(os.PathSeparator)) {
+			return "", fmt.Errorf("restore source %q resolves outside %s", from, base)
+		}
 	}
 	return resolved, nil
 }

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
@@ -100,6 +101,15 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		}
 	}
 
+	// set the VM/run store paths on the hypervisor config. newSandbox normally does this
+	// (sandbox.go), but createSandbox's rehydrate early-return skips it -- and without
+	// VMStorePath the CLH socket paths become relative (uuid/clh-api.sock) so CLH creates them
+	// under cwd instead of /run/vc/vm/<uuid>/, leaving the agent's absolute vsock unreachable.
+	if drv, derr := persist.GetDriver(); derr == nil && drv != nil {
+		sandboxConfig.HypervisorConfig.VMStorePath = drv.RunVMStoragePath()
+		sandboxConfig.HypervisorConfig.RunStorePath = drv.RunStoragePath()
+	}
+
 	// build the Sandbox shell. with persist seeded, createSandbox early-returns a
 	// rehydrated struct without doing fresh-boot agent work.
 	s, err := createSandbox(ctx, *sandboxConfig, nil)
@@ -159,12 +169,46 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		return nil, fmt.Errorf("resume restored vm: %w", err)
 	}
 
+	// confirm the kata-agent is alive now that the VM is resumed. NewVMFromSnapshot skips this
+	// check because a paused VM has no serviceable agent; do it here so we hand containerd a
+	// sandbox whose agent is actually reachable -- otherwise the sandbox Monitor's health-ping
+	// races the agent's post-resume warmup and tears the restore down. bounded retry: a briefly
+	// warming agent is not fatal, a genuinely dead one still fails the restore.
+	if err = waitAgentAlive(ctx, s); err != nil {
+		return nil, fmt.Errorf("restored agent not responsive: %w", err)
+	}
+
 	if err = s.Save(); err != nil {
 		return nil, fmt.Errorf("save restored sandbox state: %w", err)
 	}
 
 	s.Logger().WithField("restored-sandbox", newID).Info("restore: managed sandbox up")
 	return s, nil
+}
+
+// waitAgentAlive polls the guest kata-agent until it responds to a Check, or times out. the
+// just-resumed agent may take a moment to service gRPC over the vsock; poll rather than fail
+// on the first miss.
+func waitAgentAlive(ctx context.Context, s *Sandbox) error {
+	const (
+		retryInterval = 200 * time.Millisecond
+		maxWait       = 10 * time.Second
+	)
+	deadline := time.Now().Add(maxWait)
+	var lastErr error
+	for {
+		if lastErr = s.agent.check(ctx); lastErr == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("agent check failed after %s: %w", maxWait, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(retryInterval):
+		}
+	}
 }
 
 // seedPersist loads the snapshot's persist.json, rewrites the sandbox identity to newID,

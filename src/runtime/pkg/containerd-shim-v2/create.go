@@ -188,10 +188,31 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		// ctx will be canceled after this rpc service call, but the sandbox will live
 		// across multiple rpc service calls.
 		//
-		sandbox, _, err := katautils.CreateSandbox(s.ctx, vci, *ociSpec, *s.config, rootFs, r.ID, bundlePath, disableOutput, false)
+		// when the restore_from annotation is set, restore the sandbox from that snapshot
+		// instead of a fresh boot. r.ID is the containerd-assigned (fresh) sandbox id.
+		var sandbox vc.VCSandbox
+		var isRestore bool
+		if rf := ociSpec.Annotations[annotations.RestoreFrom]; rf != "" {
+			snapDir, rerr := ResolveRestoreSource(rf, true)
+			if rerr != nil {
+				return nil, fmt.Errorf("resolve restore_from %q: %w", rf, rerr)
+			}
+			shimLog.WithFields(logrus.Fields{"restore-from": rf, "snapshot-dir": snapDir, "sandbox": r.ID}).Info("dispatching restore-from-snapshot")
+			sandbox, err = vc.RestoreSandbox(s.ctx, snapDir, vc.RestoreOpts{
+				SandboxID:      r.ID,
+				HypervisorPath: s.config.HypervisorConfig.HypervisorPath,
+				KernelPath:     s.config.HypervisorConfig.KernelPath,
+				ImagePath:      s.config.HypervisorConfig.ImagePath,
+			})
+			isRestore = true
+		} else {
+			sandbox, _, err = katautils.CreateSandbox(s.ctx, vci, *ociSpec, *s.config, rootFs, r.ID, bundlePath, disableOutput, false)
+		}
 		if err != nil {
 			return nil, err
 		}
+		// only mark restored on success -- a failed restore must not leave the flag set.
+		s.restoredSandbox = isRestore
 		s.sandbox = sandbox
 		pid, err := s.sandbox.GetHypervisorPid()
 		if err != nil {

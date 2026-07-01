@@ -39,7 +39,7 @@ var restoreCLICommand = cli.Command{
 		if from == "" {
 			return fmt.Errorf("--from is required")
 		}
-		src, err := containerdshim.ResolveRestoreSource(from)
+		src, err := containerdshim.ResolveRestoreSource(from, false)
 		if err != nil {
 			return err
 		}

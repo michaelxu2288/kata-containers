@@ -35,10 +35,15 @@ func startContainer(ctx context.Context, s *service, c *container) (retErr error
 	}
 
 	if c.cType.IsSandbox() {
-		err := s.sandbox.Start(ctx)
-		if err != nil {
-			return err
+		// a restored sandbox is already running (RestoreSandbox resumed the VM during Create);
+		// re-running sandbox.Start() would fail the running->running state transition. skip it
+		// and go straight to the monitor/watch wiring below.
+		if !s.restoredSandbox {
+			if err := s.sandbox.Start(ctx); err != nil {
+				return err
+			}
 		}
+		var err error
 		// Start monitor after starting sandbox
 		s.monitor, err = s.sandbox.Monitor(ctx)
 		if err != nil {
