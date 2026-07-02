@@ -55,9 +55,16 @@ func startContainer(ctx context.Context, s *service, c *container) (retErr error
 		// shim context and the context passed to startContainer for tracing.
 		go watchOOMEvents(ctx, s)
 	} else {
-		_, err := s.sandbox.StartContainer(ctx, c.id)
-		if err != nil {
-			return err
+		// on a restored sandbox the app container is already RUNNING in the guest (adopted at
+		// Create via RestoreContainer, marked Running). the guest agent has no "start an
+		// already-running container" op -- StartContainer would fail the Ready-state gate. skip
+		// the guest start; the container is live. (mirror of the sandbox Start-skip above.)
+		if !s.restoredSandbox {
+			_, err := s.sandbox.StartContainer(ctx, c.id)
+			if err != nil {
+				return err
+			}
+		} else {
 		}
 	}
 
