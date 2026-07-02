@@ -2464,7 +2464,11 @@ func (k *kataAgent) readProcessStdout(ctx context.Context, c *Container, process
 		defer k.disconnect(ctx)
 	}
 
-	return k.readProcessStream(c.id, processID, data, k.client.AgentServiceClient.ReadStdout)
+	// T5-exec: a restored/adopted container is known to the guest by its guestID + guest
+	// exec-id, not the host clone id. mirror writeProcessStdin (which already maps both) so
+	// ReadStdout targets the live guest process; otherwise the guest returns no data -> EOF ->
+	// empty output on  into a restored clone.
+	return k.readProcessStream(c.agentID(), c.guestExecID(processID), data, k.client.AgentServiceClient.ReadStdout)
 }
 
 // readStdout and readStderr are special that we cannot differentiate them with the request types...
@@ -2476,7 +2480,8 @@ func (k *kataAgent) readProcessStderr(ctx context.Context, c *Container, process
 		defer k.disconnect(ctx)
 	}
 
-	return k.readProcessStream(c.id, processID, data, k.client.AgentServiceClient.ReadStderr)
+	// T5-exec: map to the guest-known container + exec id (see readProcessStdout).
+	return k.readProcessStream(c.agentID(), c.guestExecID(processID), data, k.client.AgentServiceClient.ReadStderr)
 }
 
 type readFn func(context.Context, *grpc.ReadStreamRequest) (*grpc.ReadStreamResponse, error)
