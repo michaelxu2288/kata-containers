@@ -28,6 +28,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
 use std::str::{self, FromStr};
 
+// KATA_IFACE_NEUTRALIZE is a host-set sentinel bit in Interface.raw_flags that asks the agent to
+// NEUTRALIZE (down + flush every address) the matched link instead of configuring it. it uses the
+// high bit, which is never a real IFF_* flag, so it can't collide with flags the host normally
+// sends. the snapshot/restore path uses it to disable the FROZEN snapshot NIC baked into a restored
+// clone's RAM, so the clone shares no mac/ip/route identity with its source.
+pub const KATA_IFACE_NEUTRALIZE: u32 = 0x8000_0000;
+
 /// Search criteria to use when looking for a link in `find_link`.
 pub enum LinkFilter<'a> {
     /// Find by link name.
@@ -111,6 +118,18 @@ impl Handle {
         // we cannot use that to find target link.
         // let's try if hardware address filter works. -_-
         let link = self.find_link(LinkFilter::Address(&iface.hwAddr)).await?;
+
+        // neutralize path: the host asked us to disable this NIC (down + flush all addresses) and
+        // return, instead of configuring it. used to kill the frozen snapshot NIC on a restored
+        // clone so it shares no network identity with its source. matched by mac (already found
+        // above), so it never touches the clone's real CNI NIC.
+        if iface.raw_flags & KATA_IFACE_NEUTRALIZE != 0 {
+            if link.is_up() {
+                self.enable_link(link.index(), false).await?;
+            }
+            self.del_all_addresses(link.index()).await?;
+            return Ok(());
+        }
 
         // Bring down interface if it is UP
         if link.is_up() {
@@ -606,6 +625,26 @@ impl Handle {
                 .execute()
                 .await
                 .map_err(|err| anyhow!("Failed to add address {}: {:?}", net.ip(), err))?;
+        }
+
+        Ok(())
+    }
+
+    // del_all_addresses removes every address currently on a link. it lists the link's addresses
+    // (same handle used to add them) and deletes each AddressMessage. used by the neutralize path to
+    // flush the frozen snapshot NIC so its stale pod ip can't leak into (or black-hole) a clone.
+    async fn del_all_addresses(&mut self, index: u32) -> Result<()> {
+        let addrs = self
+            .list_addresses(AddressFilter::LinkIndex(index))
+            .await?;
+        for addr in addrs {
+            let msg = addr.0;
+            self.handle
+                .address()
+                .del(msg)
+                .execute()
+                .await
+                .map_err(|err| anyhow!("Failed to delete address on link {}: {:?}", index, err))?;
         }
 
         Ok(())
