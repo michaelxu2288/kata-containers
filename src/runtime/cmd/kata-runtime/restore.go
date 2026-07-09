@@ -552,21 +552,22 @@ func reIP(agentCtl, vsock, mac, guestIP string) error {
 	ifJSON := fmt.Sprintf(`UpdateInterface json://{"interface": {"name": "eth0", "device": "", "mtu": 1500, "hwAddr": "%s", "IPAddresses": [{"family": 0, "address": "%s", "mask": "%s"}]}}`, mac, addr, mask)
 	server := "unix://" + vsock
 	for attempt := 0; attempt < 2; attempt++ {
-		// timeout 15: kata-agent-ctl can hang after the RPC actually succeeds.
-		exec.Command("timeout", "15", agentCtl, "connect", "--server-address", server, "--hybrid-vsock", "true", "-c", ifJSON).Run()
-		// the IP takes a few seconds to settle (5s counter / 8s pyruntime); poll.
-		for i := 0; i < 6; i++ {
-			time.Sleep(2 * time.Second)
+		// timeout 3: the UpdateInterface RPC succeeds in <1s; kata-agent-ctl then hangs, so we
+		// kill it fast instead of waiting the old 15s (that hang was most of the restore time).
+		exec.Command("timeout", "3", agentCtl, "connect", "--server-address", server, "--hybrid-vsock", "true", "-c", ifJSON).Run()
+		// poll fast, check immediately first (IP is usually up in <1s).
+		for i := 0; i < 12; i++ {
 			if ipPresent(agentCtl, server, addr) {
 				return nil
 			}
+			time.Sleep(400 * time.Millisecond)
 		}
 	}
 	return fmt.Errorf("re-IP failed: %s not visible on eth0 after retry (check kata-agent-ctl ListInterfaces)", addr)
 }
 
 func ipPresent(agentCtl, server, addr string) bool {
-	out, _ := exec.Command("timeout", "10", agentCtl, "connect", "--server-address", server, "--hybrid-vsock", "true", "-c", "ListInterfaces").CombinedOutput()
+	out, _ := exec.Command("timeout", "3", agentCtl, "connect", "--server-address", server, "--hybrid-vsock", "true", "-c", "ListInterfaces").CombinedOutput()
 	// match addr as a whole token, not a substring: otherwise 192.168.240.1 would
 	// falsely match inside 192.168.240.10 (auto-allocated subnets go up to .254).
 	return hasIPToken(string(out), addr)
