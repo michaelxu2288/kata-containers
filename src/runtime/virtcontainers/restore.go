@@ -65,6 +65,11 @@ type RestoreOpts struct {
 
 // RestoreSandbox restores a snapshot directory as a fully-wired, running *Sandbox.
 func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (_ *Sandbox, err error) {
+	// perf: top-level RESTORE phase timer. best-effort; nil-safe; emits warn-level
+	// phase-timing lines + a RESTORE_PHASES summary. covers both the annotation flow
+	// (shim create.go) and the CLI flow (RunRestore), which both call RestoreSandbox.
+	rt := newPhaseTimer("RESTORE", "", virtLog)
+
 	if _, statErr := os.Stat(filepath.Join(snapshotDir, "config.json")); statErr != nil {
 		return nil, fmt.Errorf("not a snapshot dir (no config.json): %s", snapshotDir)
 	}
@@ -77,6 +82,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err := validateSandboxID(newID); err != nil {
 		return nil, err
 	}
+	rt.id = newID
 
 	// seed the persist store for newID so createSandbox -> s.Restore() rehydrates
 	// endpoints/devices/containers and the "state != empty" early-return fires (skipping
@@ -148,6 +154,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 
 	// build the Sandbox shell. with persist seeded, createSandbox early-returns a
 	// rehydrated struct without doing fresh-boot agent work.
+	rt.phase("config")
 	s, err := createSandbox(ctx, *sandboxConfig, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create restored sandbox: %w", err)
@@ -212,6 +219,8 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 			return nil, err
 		}
 	}
+	// perf: config-build + cgroups + coldplug of the CNI netns endpoints (netns adoption).
+	rt.phase("netnsAdopt")
 
 	// boot the VM from the snapshot: CreateVM -> launchAndInit (virtiofsd + CLH) ->
 	// RestoreVM. returns PAUSED. T4a Step 5: run it INSIDE the CNI netns via network.Run ->
@@ -232,6 +241,9 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err != nil {
 		return nil, fmt.Errorf("restore vm from snapshot: %w", err)
 	}
+	// perf: VM boot from snapshot (CreateVM -> launchAndInit -> RestoreVM). the clh
+	// RestoreVM emits its own VMBOOT_PHASES sub-breakdown (launchInit/prepFiles/memFill).
+	rt.phase("vmboot")
 	defer func() {
 		if err != nil {
 			s.stopVM(ctx)
@@ -256,6 +268,8 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err = adoptPauseContainer(ctx, s, newID, origSandboxID); err != nil {
 		return nil, fmt.Errorf("adopt restored pause container: %w", err)
 	}
+	// perf: attach VM to sandbox + rehydrate pause-container identity.
+	rt.phase("assign")
 
 	// best-effort networking, only when a guest IP was requested; never fatal.
 	if opts.GuestIP != "" {
@@ -268,6 +282,8 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err = vm.Resume(ctx); err != nil {
 		return nil, fmt.Errorf("resume restored vm: %w", err)
 	}
+	// perf: best-effort CLI-networking (if any) + guest resume.
+	rt.phase("resume")
 
 	// T4a Step 6 (sub-plan 2, restore-then-hotplug): bind the CNI tap to the now-running
 	// restored VM. Step 4 coldplugged the endpoint (host tap + fds in the CNI netns) but the
@@ -282,6 +298,8 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 				s.Logger().WithError(herr).Warn("restore: hotplug CNI net device failed; pod may not be reachable on its CNI IP")
 			}
 		}
+		// perf: hotplug the adopted CNI endpoints onto the live VM.
+		rt.phase("endpointHotplug")
 
 		// T4b (Design B): configure the freshly-hotplugged CNI NIC in the guest -- give it the
 		// pod's real CNI IP + install the default route -- and neutralize the FROZEN snapshot NIC
@@ -291,11 +309,17 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		if nerr := applyRestoreNetwork(ctx, s); nerr != nil {
 			s.Logger().WithError(nerr).Warn("restore: applying CNI network to guest failed; pod may lack reachability/egress")
 		}
+		// perf: guest re-IP + routes + frozen-NIC neutralize (applyRestoreNetwork emits its
+		// own NETWORK_PHASES sub-breakdown: guestReIP/routeInstall/neutralizeNIC).
+		rt.phase("network")
 	}
 
 	if err = s.Save(); err != nil {
 		return nil, fmt.Errorf("save restored sandbox state: %w", err)
 	}
+	// perf: persist restored sandbox state + emit the RESTORE_PHASES summary.
+	rt.phase("save")
+	rt.summary()
 
 	s.Logger().WithField("restored-sandbox", newID).Info("restore: managed sandbox up")
 	return s, nil
@@ -500,6 +524,10 @@ const (
 // which collides with the frozen snapshot NIC that also holds "eth0"). The guest keeps its own
 // device names (e.g. the CNI NIC stays eth1); functionally correct, and collision-free.
 func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
+	// perf: NETWORK sub-phase timer (guestReIP / routeInstall / neutralizeNIC).
+	nt := newPhaseTimer("NETWORK", s.id, virtLog)
+	defer nt.summary()
+
 	eps := s.network.Endpoints()
 	if len(eps) == 0 {
 		return fmt.Errorf("no CNI endpoints adopted; nothing to configure")
@@ -540,6 +568,8 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 		}
 	}
 	s.Logger().WithField("restore-net", "interfaces-applied").WithField("count", len(ifaces)).Info("restore: CNI interfaces configured")
+	// perf: guest re-IP of the adopted CNI NICs (the updateInterface RPCs).
+	nt.phase("guestReIP")
 
 	// install routes. updateRoutes matches the link by DEVICE NAME, so remap each route's Device
 	// from the endpoint name to the guest's actual iface name.
@@ -589,6 +619,8 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 			s.Logger().WithField("restore-net", "override-routes").WithField("count", len(overrides)).Info("restore: pinned pod-subnet route to CNI NIC (frozen-NIC isolation)")
 		}
 	}
+	// perf: install CNI routes + pin pod-subnet override routes to the live NIC.
+	nt.phase("routeInstall")
 
 	// isolation: neutralize the frozen snapshot NIC (the source pod's identity baked into the
 	// clone's RAM). any guest iface whose MAC is NOT owned by an adopted CNI endpoint is the
@@ -596,6 +628,8 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 	// mac/ip/route with its source. this is what makes TCP + egress work (the frozen NIC's stale
 	// /16 route otherwise black-holes) AND delivers complete isolation.
 	neutralizeFrozenNIC(ctx, s, before, eps)
+	// perf: down + flush the frozen snapshot NIC (clone isolation).
+	nt.phase("neutralizeNIC")
 
 	return nil
 }
