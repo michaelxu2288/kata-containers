@@ -65,6 +65,11 @@ type RestoreOpts struct {
 
 // RestoreSandbox restores a snapshot directory as a fully-wired, running *Sandbox.
 func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (_ *Sandbox, err error) {
+	// perf: top-level RESTORE phase timer. best-effort; nil-safe; emits warn-level
+	// phase-timing lines + a RESTORE_PHASES summary. covers both the annotation flow
+	// (shim create.go) and the CLI flow (RunRestore), which both call RestoreSandbox.
+	rt := newPhaseTimer("RESTORE", "", virtLog)
+
 	if _, statErr := os.Stat(filepath.Join(snapshotDir, "config.json")); statErr != nil {
 		return nil, fmt.Errorf("not a snapshot dir (no config.json): %s", snapshotDir)
 	}
@@ -77,6 +82,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err := validateSandboxID(newID); err != nil {
 		return nil, err
 	}
+	rt.id = newID
 
 	// seed the persist store for newID so createSandbox -> s.Restore() rehydrates
 	// endpoints/devices/containers and the "state != empty" early-return fires (skipping
@@ -136,7 +142,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	sandboxConfig.HypervisorConfig.VMStorePath = drv.RunVMStoragePath()
 	sandboxConfig.HypervisorConfig.RunStorePath = drv.RunStoragePath()
 
-	// T4a: point the network config at the pod's CNI netns so the restored VM boots INSIDE it
+	// point the network config at the pod's CNI netns so the restored VM boots INSIDE it
 	// and adopts the CNI tap (real pod IP), instead of the empty netns NewVMFromSnapshot builds.
 	// NetworkID IS literally the netns path (oci/utils.go). the shim sourced this from the LIVE
 	// OCI spec; the persisted config's NetworkID is the SOURCE sandbox's netns and must NOT be
@@ -148,13 +154,14 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 
 	// build the Sandbox shell. with persist seeded, createSandbox early-returns a
 	// rehydrated struct without doing fresh-boot agent work.
+	rt.phase("config")
 	s, err := createSandbox(ctx, *sandboxConfig, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create restored sandbox: %w", err)
 	}
 	defer func() {
 		if err != nil {
-			// M2: a restored sandbox rehydrates state="running", but Sandbox.Delete
+			// a restored sandbox rehydrates state="running", but Sandbox.Delete
 			// hard-returns for anything not Ready/Paused/Stopped -- so a plain
 			// s.Delete(ctx) here is a NO-OP and leaks the cgroup slice, seeded persist
 			// store, sandbox dir, and assignSandbox symlinks on any late error. force
@@ -165,7 +172,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		}
 	}()
 
-	// S3: the restore path depends on createSandbox's rehydrate early-return firing, which
+	// the restore path depends on createSandbox's rehydrate early-return firing, which
 	// requires the seeded persist to carry state="running" (the snapshot was taken of a
 	// running sandbox). if it does not, createSandbox fell through to fresh-boot work OR the
 	// seed was malformed -- either way the shim (T2.1) will unconditionally skip Start and we
@@ -175,7 +182,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		return nil, err
 	}
 
-	// T4a Step 3: reset s.network to the CLONE's CNI netns. newSandbox built s.network from the
+	// reset s.network to the CLONE's CNI netns. newSandbox built s.network from the
 	// config, but createSandbox -> s.Restore() -> loadNetwork OVERWROTE it with the SOURCE
 	// sandbox's persisted netns + stale endpoints. rebuild it from the clone NetworkConfig
 	// (NetworkID = the CNI netns path set above) so AddEndpoints/Run below operate on the RIGHT
@@ -202,7 +209,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		return nil, fmt.Errorf("create restored sandbox dir: %w", err)
 	}
 
-	// T4a Step 4: coldplug the CNI netns endpoints BEFORE launching the VM (mirrors startVM's
+	// coldplug the CNI netns endpoints BEFORE launching the VM (mirrors startVM's
 	// createNetwork -> AddEndpoints(...,false) at sandbox.go:1027). this scans the clone netns,
 	// builds the veth/tap endpoint, populates TapInterface.VMFds, and clh.addNet stashes the tap
 	// fds keyed by MAC -- so the VM launch below can bind the guest NIC to the real CNI tap.
@@ -212,12 +219,14 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 			return nil, err
 		}
 	}
+	// perf: config-build + cgroups + coldplug of the CNI netns endpoints (netns adoption).
+	rt.phase("netnsAdopt")
 
 	// boot the VM from the snapshot: CreateVM -> launchAndInit (virtiofsd + CLH) ->
-	// RestoreVM. returns PAUSED. T4a Step 5: run it INSIDE the CNI netns via network.Run ->
+	// RestoreVM. returns PAUSED. run it INSIDE the CNI netns via network.Run ->
 	// doNetNS (LockOSThread + setns), so CLH's exec.Command fork inherits the pod netns and its
 	// tap lives in the right namespace. with no netns (opts.NetNSPath==""), Run's doNetNS is a
-	// no-op in the current namespace -- identical to the pre-T4a behavior.
+	// no-op in the current namespace -- identical to the no-networking behavior.
 	vmConfig := VMConfig{
 		HypervisorType:   sandboxConfig.HypervisorType,
 		HypervisorConfig: sandboxConfig.HypervisorConfig,
@@ -232,6 +241,9 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err != nil {
 		return nil, fmt.Errorf("restore vm from snapshot: %w", err)
 	}
+	// perf: VM boot from snapshot (CreateVM -> launchAndInit -> RestoreVM). the clh
+	// RestoreVM emits its own VMBOOT_PHASES sub-breakdown (launchInit/prepFiles/memFill).
+	rt.phase("vmboot")
 	defer func() {
 		if err != nil {
 			s.stopVM(ctx)
@@ -243,7 +255,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		return nil, fmt.Errorf("assign restored vm to sandbox: %w", err)
 	}
 
-	// Q2 RehydratePodIdentity: build the host-side PAUSE/sandbox Container object keyed to
+	// build the host-side PAUSE/sandbox Container object keyed to
 	// newID and register it in s.containers, so the shim's Start -> IOStream(newID,newID) ->
 	// findContainer(newID) succeeds. Without it Start fails "Could not find the container from
 	// the sandbox containers list" and containerd tears the sandbox down. Pause-container only:
@@ -256,6 +268,8 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err = adoptPauseContainer(ctx, s, newID, origSandboxID); err != nil {
 		return nil, fmt.Errorf("adopt restored pause container: %w", err)
 	}
+	// perf: attach VM to sandbox + rehydrate pause-container identity.
+	rt.phase("assign")
 
 	// best-effort networking, only when a guest IP was requested; never fatal.
 	if opts.GuestIP != "" {
@@ -268,13 +282,15 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err = vm.Resume(ctx); err != nil {
 		return nil, fmt.Errorf("resume restored vm: %w", err)
 	}
+	// perf: best-effort CLI-networking (if any) + guest resume.
+	rt.phase("resume")
 
-	// T4a Step 6 (sub-plan 2, restore-then-hotplug): bind the CNI tap to the now-running
-	// restored VM. Step 4 coldplugged the endpoint (host tap + fds in the CNI netns) but the
+	// bind the CNI tap to the now-running restored VM. the coldplug above staged the
+	// endpoint (host tap + fds in the CNI netns) but the
 	// restore path never sends net devices to CLH (bootVM's vmAddNetPut is skipped on restore).
 	// so hotplug-add each adopted endpoint to the live VM via SCM_RIGHTS (hotplugAddNetDevice ->
 	// addNet + vmAddNetPut). the guest sees the CNI tap as a NEW nic (the snapshot's frozen nic
-	// stays); T4b re-IPs whichever iface carries the CNI tap. never fatal here -- a networking
+	// stays); applyRestoreNetwork re-IPs whichever iface carries the CNI tap. never fatal here -- a networking
 	// failure must not tear down an otherwise-good restore (the sandbox is still managed).
 	if opts.NetNSPath != "" {
 		for _, ep := range s.network.Endpoints() {
@@ -282,8 +298,10 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 				s.Logger().WithError(herr).Warn("restore: hotplug CNI net device failed; pod may not be reachable on its CNI IP")
 			}
 		}
+		// perf: hotplug the adopted CNI endpoints onto the live VM.
+		rt.phase("endpointHotplug")
 
-		// T4b (Design B): configure the freshly-hotplugged CNI NIC in the guest -- give it the
+		// configure the freshly-hotplugged CNI NIC in the guest -- give it the
 		// pod's real CNI IP + install the default route -- and neutralize the FROZEN snapshot NIC
 		// so the clone carries ONLY its own network identity (complete isolation: the two clones
 		// never knew each other). never fatal: a networking failure must leave a managed sandbox
@@ -291,11 +309,17 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		if nerr := applyRestoreNetwork(ctx, s); nerr != nil {
 			s.Logger().WithError(nerr).Warn("restore: applying CNI network to guest failed; pod may lack reachability/egress")
 		}
+		// perf: guest re-IP + routes + frozen-NIC neutralize (applyRestoreNetwork emits its
+		// own NETWORK_PHASES sub-breakdown: guestReIP/routeInstall/neutralizeNIC).
+		rt.phase("network")
 	}
 
 	if err = s.Save(); err != nil {
 		return nil, fmt.Errorf("save restored sandbox state: %w", err)
 	}
+	// perf: persist restored sandbox state + emit the RESTORE_PHASES summary.
+	rt.phase("save")
+	rt.summary()
 
 	s.Logger().WithField("restored-sandbox", newID).Info("restore: managed sandbox up")
 	return s, nil
@@ -304,8 +328,8 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 // adoptPauseContainer builds the host-side *Container for the restored sandbox's pause
 // container (id == sandbox id == newID after seedPersist re-keyed it) and registers it in
 // s.containers, WITHOUT creating it in the guest (it is already live from the snapshot).
-// mirrors fetchContainers, but for the single pause entry only. this is the Q2
-// RehydratePodIdentity adopt the shim's Start/IOStream path depends on.
+// mirrors fetchContainers, but for the single pause entry only. the shim's
+// Start/IOStream path depends on this adopt.
 func adoptPauseContainer(ctx context.Context, s *Sandbox, newID, origSandboxID string) error {
 	for i := range s.config.Containers {
 		cc := &s.config.Containers[i]
@@ -450,7 +474,7 @@ func seedPersist(snapshotDir, newID string) (string, error) {
 	ss.HypervisorState.APISocket = ""
 
 	// rehydrate identity of the PAUSE/sandbox container so the restored Sandbox gets a
-	// host-side Container object keyed to newID (Q2 RehydratePodIdentity). the shim's Start ->
+	// host-side Container object keyed to newID. the shim's Start ->
 	// IOStream(newID, newID) -> Sandbox.findContainer(newID) needs it; without it Start fails
 	// "Could not find the container from the sandbox containers list" and containerd tears the
 	// sandbox down. the sandbox/pause container's id == the sandbox id, so it must move to
@@ -492,7 +516,7 @@ const (
 	containerdBundleBase       = "/run/containerd/io.containerd.runtime.v2.task/k8s.io"
 )
 
-// applyRestoreNetwork configures the restored guest's CNI networking (Design B). It reuses the
+// applyRestoreNetwork configures the restored guest's CNI networking. It reuses the
 // SAME structures the fresh-boot path builds (generateVCNetworkStructures over the adopted CNI
 // endpoints, which carry the real pod IP/routes captured by AddEndpoints), but AVOIDS renaming
 // guest interfaces: it matches each generated interface to the guest's CURRENT interface name by
@@ -500,6 +524,10 @@ const (
 // which collides with the frozen snapshot NIC that also holds "eth0"). The guest keeps its own
 // device names (e.g. the CNI NIC stays eth1); functionally correct, and collision-free.
 func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
+	// perf: NETWORK sub-phase timer (guestReIP / routeInstall / neutralizeNIC).
+	nt := newPhaseTimer("NETWORK", s.id, virtLog)
+	defer nt.summary()
+
 	eps := s.network.Endpoints()
 	if len(eps) == 0 {
 		return fmt.Errorf("no CNI endpoints adopted; nothing to configure")
@@ -540,6 +568,8 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 		}
 	}
 	s.Logger().WithField("restore-net", "interfaces-applied").WithField("count", len(ifaces)).Info("restore: CNI interfaces configured")
+	// perf: guest re-IP of the adopted CNI NICs (the updateInterface RPCs).
+	nt.phase("guestReIP")
 
 	// install routes. updateRoutes matches the link by DEVICE NAME, so remap each route's Device
 	// from the endpoint name to the guest's actual iface name.
@@ -589,6 +619,8 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 			s.Logger().WithField("restore-net", "override-routes").WithField("count", len(overrides)).Info("restore: pinned pod-subnet route to CNI NIC (frozen-NIC isolation)")
 		}
 	}
+	// perf: install CNI routes + pin pod-subnet override routes to the live NIC.
+	nt.phase("routeInstall")
 
 	// isolation: neutralize the frozen snapshot NIC (the source pod's identity baked into the
 	// clone's RAM). any guest iface whose MAC is NOT owned by an adopted CNI endpoint is the
@@ -596,6 +628,8 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 	// mac/ip/route with its source. this is what makes TCP + egress work (the frozen NIC's stale
 	// /16 route otherwise black-holes) AND delivers complete isolation.
 	neutralizeFrozenNIC(ctx, s, before, eps)
+	// perf: down + flush the frozen snapshot NIC (clone isolation).
+	nt.phase("neutralizeNIC")
 
 	return nil
 }

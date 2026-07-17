@@ -891,13 +891,19 @@ func (clh *cloudHypervisor) RestoreVM(ctx context.Context, snapshotDir string) e
 
 	clh.Logger().WithField("function", "RestoreVM").Info("restoring Sandbox")
 
+	// perf: VMBOOT sub-phase timer (launchInit / prepFiles / memFill). mirrors the
+	// branch-3 VMBOOT_PHASES breakdown so numbers diff directly.
+	vt := newPhaseTimer("VMBOOT", clh.id, clh.Logger())
+
 	if err := clh.launchAndInit(ctx); err != nil {
 		return err
 	}
+	vt.phase("launchInit")
 
 	if err := clh.prepareRestoreFiles(snapshotDir); err != nil {
 		return err
 	}
+	vt.phase("prepFiles")
 
 	ctx, cancel := clh.bootTimeoutContext(ctx)
 	defer cancel()
@@ -905,6 +911,8 @@ func (clh *cloudHypervisor) RestoreVM(ctx context.Context, snapshotDir string) e
 	if err := clh.restoreVM(ctx); err != nil {
 		return err
 	}
+	vt.phase("memFill")
+	vt.summary()
 
 	clh.state.state = clhReady
 	return nil
