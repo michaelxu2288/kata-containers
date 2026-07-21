@@ -37,6 +37,9 @@ type container struct {
 	status      task.Status
 	terminal    bool
 	mounted     bool
+	// restorePauseIOArmPending marks a restored sandbox pause task whose IO/wait was deferred at
+	// startContainer (VM paused) and must be armed once at workload start (M4).
+	restorePauseIOArmPending bool
 }
 
 func newContainer(s *service, r *taskAPI.CreateTaskRequest, containerType vc.ContainerType, spec *specs.Spec, mounted bool) (*container, error) {

@@ -11,16 +11,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
+	vcAnnotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/compatoci"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
@@ -28,13 +26,6 @@ import (
 // restore.go builds a real, kata-managed *Sandbox from a `kata-runtime snapshot` dir. it
 // boots via NewVMFromSnapshot and skips container creation (the containers are already live
 // in the snapshotted guest RAM).
-
-// kataIfaceNeutralize is a raw_flags sentinel (a high bit that is NOT a valid IFF_* flag) the
-// restore path sets on the frozen source NIC of a cloned VM. the guest kata-agent's
-// update_interface handles it by DOWNING the link + DELETING all its addresses, so the clone
-// shares no network identity with its source. MUST match KATA_IFACE_NEUTRALIZE in the rust
-// agent (src/agent/src/netlink.rs).
-const kataIfaceNeutralize uint32 = 0x8000_0000
 
 // RestoreOpts parameterizes a restore.
 type RestoreOpts struct {
@@ -50,11 +41,6 @@ type RestoreOpts struct {
 	KernelPath     string
 	ImagePath      string
 
-	// optional CIDR (e.g. "192.168.240.1/24"); when set, best-effort host tap + agent
-	// re-IP so the guest gets a fresh non-colliding address. empty skips networking (the
-	// sandbox is still real + managed, just not reachable on a new IP).
-	GuestIP string
-
 	// path to the pod's CNI network namespace (e.g. /var/run/netns/cni-<id>), read by the
 	// shim from the LIVE OCI spec (containerd ran CNI ADD during RunPodSandbox). when set, the
 	// restore boots the VM INSIDE this netns and adopts its tap, so the restored guest lands on
@@ -65,13 +51,20 @@ type RestoreOpts struct {
 
 // RestoreSandbox restores a snapshot directory as a fully-wired, running *Sandbox.
 func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (_ *Sandbox, err error) {
-	// perf: top-level RESTORE phase timer. best-effort; nil-safe; emits warn-level
-	// phase-timing lines + a RESTORE_PHASES summary. covers both the annotation flow
-	// (shim create.go) and the CLI flow (RunRestore), which both call RestoreSandbox.
-	rt := newPhaseTimer("RESTORE", "", virtLog)
-
 	if _, statErr := os.Stat(filepath.Join(snapshotDir, "config.json")); statErr != nil {
 		return nil, fmt.Errorf("not a snapshot dir (no config.json): %s", snapshotDir)
+	}
+
+	// fail BEFORE mutating any restore-side state (seedPersist below writes the store) if the
+	// snapshot is not cloud-hypervisor: a snapshot is a CLH memory-ranges dump + CLH config.json
+	// and is unrestorable under any other hypervisor. hypervisor-agnostic file-backed restore is
+	// future work; here a foreign snapshot is a fatal restore error, not a silent mis-boot.
+	hvType, err := snapshotHypervisorType(snapshotDir)
+	if err != nil {
+		return nil, err
+	}
+	if HypervisorType(hvType) != ClhHypervisor {
+		return nil, fmt.Errorf("kata restore failed: snapshot hypervisor %q is not %q; only cloud-hypervisor restore is supported", hvType, ClhHypervisor)
 	}
 
 	// new id, always: the source sandbox may be live, so we never reuse its id.
@@ -82,7 +75,6 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err := validateSandboxID(newID); err != nil {
 		return nil, err
 	}
-	rt.id = newID
 
 	// seed the persist store for newID so createSandbox -> s.Restore() rehydrates
 	// endpoints/devices/containers and the "state != empty" early-return fires (skipping
@@ -113,16 +105,14 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	}
 
 	// map the rebuilt config's guest memory MAP_PRIVATE (COW). CLH-specific: the snapshot is a
-	// CLH memory-ranges dump + config.json, so both the file-backed mapping and the in-dir
-	// config.json private-patch only make sense for cloud-hypervisor. gate both so a non-CLH
-	// restore does not mmap a foreign CLH RAM dump or mis-patch a foreign config.
+	// CLH memory-ranges dump + config.json. The file-backed mapping is set here; the config.json
+	// memory-private + vsock + net_fds-marker patch is applied ONLY to H2's private copy inside
+	// prepareRestoreFiles (preparePrivateRestoreConfig), so the caller-owned source snapshot dir is
+	// never modified (B5). Gate on CLH so a non-CLH restore does not mmap a foreign CLH RAM dump.
 	if sandboxConfig.HypervisorType == ClhHypervisor {
 		sandboxConfig.HypervisorConfig.FileBackedMemory = &FileBackedMemoryConfig{
 			Path:   filepath.Join(snapshotDir, "memory-ranges"),
 			Shared: false,
-		}
-		if err := PatchCLHSnapshotMemoryPrivate(snapshotDir); err != nil {
-			return nil, fmt.Errorf("patch snapshot memory private: %w", err)
 		}
 	}
 
@@ -154,7 +144,6 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 
 	// build the Sandbox shell. with persist seeded, createSandbox early-returns a
 	// rehydrated struct without doing fresh-boot agent work.
-	rt.phase("config")
 	s, err := createSandbox(ctx, *sandboxConfig, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create restored sandbox: %w", err)
@@ -213,24 +202,33 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	// createNetwork -> AddEndpoints(...,false) at sandbox.go:1027). this scans the clone netns,
 	// builds the veth/tap endpoint, populates TapInterface.VMFds, and clh.addNet stashes the tap
 	// fds keyed by MAC -- so the VM launch below can bind the guest NIC to the real CNI tap.
+	//
+	// restoreNetFence=true makes the endpoint attach PREPARE the tap DOWN with no TC redirects (the
+	// fence). The stale source guest identity therefore cannot reach the target network when the VM
+	// resumes; FinalizeRestoreNetwork installs the redirects + brings the tap up only after the
+	// guest identity has been reconciled and verified.
 	if opts.NetNSPath != "" {
+		s.restoreNetFence = true
 		if _, nerr := s.network.AddEndpoints(ctx, s, nil, false); nerr != nil {
 			err = fmt.Errorf("restore: adopt CNI netns endpoints: %w", nerr)
 			return nil, err
 		}
 	}
-	// perf: config-build + cgroups + coldplug of the CNI netns endpoints (netns adoption).
-	rt.phase("netnsAdopt")
 
 	// boot the VM from the snapshot: CreateVM -> launchAndInit (virtiofsd + CLH) ->
 	// RestoreVM. returns PAUSED. run it INSIDE the CNI netns via network.Run ->
 	// doNetNS (LockOSThread + setns), so CLH's exec.Command fork inherits the pod netns and its
 	// tap lives in the right namespace. with no netns (opts.NetNSPath==""), Run's doNetNS is a
 	// no-op in the current namespace -- identical to the no-networking behavior.
+	//
+	// netfds rework: pass the adopted CNI endpoints so RestoreVM backs the EXISTING guest NIC with
+	// their fresh host tap FDs (CLH vm.restore net_fds) instead of the old post-resume 2nd-NIC
+	// hotplug. The endpoints carry the tap VMFds AddEndpoints just populated in the CNI netns.
 	vmConfig := VMConfig{
-		HypervisorType:   sandboxConfig.HypervisorType,
-		HypervisorConfig: sandboxConfig.HypervisorConfig,
-		AgentConfig:      sandboxConfig.AgentConfig,
+		HypervisorType:      sandboxConfig.HypervisorType,
+		HypervisorConfig:    sandboxConfig.HypervisorConfig,
+		AgentConfig:         sandboxConfig.AgentConfig,
+		RestoreNetEndpoints: s.network.Endpoints(),
 	}
 	var vm *VM
 	err = s.network.Run(ctx, func() error {
@@ -241,12 +239,18 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err != nil {
 		return nil, fmt.Errorf("restore vm from snapshot: %w", err)
 	}
-	// perf: VM boot from snapshot (CreateVM -> launchAndInit -> RestoreVM). the clh
-	// RestoreVM emits its own VMBOOT_PHASES sub-breakdown (launchInit/prepFiles/memFill).
-	rt.phase("vmboot")
+	// H2 cleanup ownership (WP5.1/5.2): install immediately after the VM object exists. Until
+	// assignSandbox succeeds, s.hypervisor is not yet this restored VM, so s.stopVM would stop the
+	// wrong (nil/H1) hypervisor and LEAK the restored VM. Stop the actual restored VM object here;
+	// after assignSandbox, ownership transfers to s.stopVM which reaps s.hypervisor (== this VM).
+	vmAssigned := false
 	defer func() {
 		if err != nil {
-			s.stopVM(ctx)
+			if vmAssigned {
+				s.stopVM(ctx)
+			} else {
+				vm.Stop(ctx)
+			}
 		}
 	}()
 
@@ -254,6 +258,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err = vm.assignSandbox(s); err != nil {
 		return nil, fmt.Errorf("assign restored vm to sandbox: %w", err)
 	}
+	vmAssigned = true
 
 	// build the host-side PAUSE/sandbox Container object keyed to
 	// newID and register it in s.containers, so the shim's Start -> IOStream(newID,newID) ->
@@ -268,62 +273,251 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err = adoptPauseContainer(ctx, s, newID, origSandboxID); err != nil {
 		return nil, fmt.Errorf("adopt restored pause container: %w", err)
 	}
-	// perf: attach VM to sandbox + rehydrate pause-container identity.
-	rt.phase("assign")
 
-	// best-effort networking, only when a guest IP was requested; never fatal.
-	if opts.GuestIP != "" {
-		if nerr := setupRestoreNetwork(ctx, s, snapshotDir, opts.GuestIP); nerr != nil {
-			s.Logger().WithError(nerr).Warn("restore: best-effort networking failed; sandbox is up but may not be reachable on the new IP")
-		}
-	}
-
-	// un-pause the guest.
-	if err = vm.Resume(ctx); err != nil {
-		return nil, fmt.Errorf("resume restored vm: %w", err)
-	}
-	// perf: best-effort CLI-networking (if any) + guest resume.
-	rt.phase("resume")
-
-	// bind the CNI tap to the now-running restored VM. the coldplug above staged the
-	// endpoint (host tap + fds in the CNI netns) but the
-	// restore path never sends net devices to CLH (bootVM's vmAddNetPut is skipped on restore).
-	// so hotplug-add each adopted endpoint to the live VM via SCM_RIGHTS (hotplugAddNetDevice ->
-	// addNet + vmAddNetPut). the guest sees the CNI tap as a NEW nic (the snapshot's frozen nic
-	// stays); applyRestoreNetwork re-IPs whichever iface carries the CNI tap. never fatal here -- a networking
-	// failure must not tear down an otherwise-good restore (the sandbox is still managed).
-	if opts.NetNSPath != "" {
-		for _, ep := range s.network.Endpoints() {
-			if _, herr := s.hypervisor.HotplugAddDevice(ctx, ep, NetDev); herr != nil {
-				s.Logger().WithError(herr).Warn("restore: hotplug CNI net device failed; pod may not be reachable on its CNI IP")
-			}
-		}
-		// perf: hotplug the adopted CNI endpoints onto the live VM.
-		rt.phase("endpointHotplug")
-
-		// configure the freshly-hotplugged CNI NIC in the guest -- give it the
-		// pod's real CNI IP + install the default route -- and neutralize the FROZEN snapshot NIC
-		// so the clone carries ONLY its own network identity (complete isolation: the two clones
-		// never knew each other). never fatal: a networking failure must leave a managed sandbox
-		// up (retryable), not tear it down.
-		if nerr := applyRestoreNetwork(ctx, s); nerr != nil {
-			s.Logger().WithError(nerr).Warn("restore: applying CNI network to guest failed; pod may lack reachability/egress")
-		}
-		// perf: guest re-IP + routes + frozen-NIC neutralize (applyRestoreNetwork emits its
-		// own NETWORK_PHASES sub-breakdown: guestReIP/routeInstall/neutralizeNIC).
-		rt.phase("network")
-	}
+	// NETFDS RESTORE: the VM is restored PAUSED with its EXISTING guest NIC now backed by the
+	// adopted CNI endpoint's fresh host tap FDs (RestoreVM sent CLH vm.restore net_fds via the
+	// endpoints threaded into VMConfig above). No second NIC is hotplugged and the frozen snapshot
+	// NIC is reused, not neutralized.
+	//
+	//   - The guest resume is deferred to the workload StartContainer path (a CLH snapshot restores
+	//     paused; resuming here would run the app before containerd asks to start it).
+	//   - The guest's snapshotted network identity (MAC/IP/routes) is still the SOURCE pod's; the
+	//     agent-side reconciliation to the target CNI identity happens at StartContainer (stage 4).
+	//   - The host-network gate (prepare-tap-without-redirects -> activate-after-verify) is the
+	//     remaining stage-4 mechanism so the stale source identity never reaches the target network.
+	//
+	// Leaving the VM paused here exposes the next real lifecycle boundary (host-side CreateContainer
+	// adoption) without running the app or exposing it on the target network.
 
 	if err = s.Save(); err != nil {
 		return nil, fmt.Errorf("save restored sandbox state: %w", err)
 	}
-	// perf: persist restored sandbox state + emit the RESTORE_PHASES summary.
-	rt.phase("save")
-	rt.summary()
 
-	s.Logger().WithField("restored-sandbox", newID).Info("restore: managed sandbox up")
+	s.Logger().WithField("restored-sandbox", newID).Info("restore: managed sandbox up (paused, net_fds NIC backed, fence prepared TAP-down/no-redirects)")
 	return s, nil
 }
+
+// FinalizeRestoreNetwork resumes the net_fds-restored VM and reconciles its guest NIC to the target
+// CNI identity. It is called from the shim's workload StartContainer path (the restored sandbox VM
+// is paused until then). Sequence (§7.4):
+//  1. resume the VM once (a CLH snapshot restores paused; without resume neither the app nor the
+//     kata-agent can execute).
+//  2. list the guest interfaces to capture the CURRENT (snapshotted, source-pod) identity.
+//  3. apply the target CNI identity via the agent, then read back and verify.
+//
+// FinalizeRestoreNetwork resumes the net_fds-restored VM and reconciles its single guest NIC to the
+// exact target CNI identity, then activates the host-network fence. It is called from the workload
+// StartContainer path. Sequence (WP4/WP5): resume once; select the sole guest NIC by name; drive the
+// agent restore-replace (set target MAC via IFLA_ADDRESS, flush source addrs, apply target
+// addrs/MTU); install target routes + neighbors; read back and verify the exact target identity
+// (MAC + required addresses present + source addresses absent); then install both TC redirects and
+// bring the tap up as the final exposure step; finally mark the workload Running.
+//
+// This is transactional and fail-only: on ANY error the fence is kept closed and the Kata-created
+// tap/qdisc/filter is cleaned up, so the stale source identity is never forwarded. A failed Start is
+// terminal for this target (the caller reaps H2); resume is never retried on a half-mutated VM.
+func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
+
+	// abort guard (WP5): on any failure after this point, keep forwarding closed and remove the
+	// Kata-created tap/qdisc/filter for the sole adopted endpoint. The tap/veth live in the pod CNI
+	// netns, so run cleanup INSIDE that netns. Never leave a partially-exposed identity. Cleanup
+	// errors are logged, not substituted for the initiating error.
+	fenceEps := s.network.Endpoints()
+	defer func() {
+		if err != nil && len(fenceEps) > 0 {
+			_ = s.network.Run(ctx, func() error {
+				cleanupRestoreTCFence(ctx, fenceEps[0])
+				return nil
+			})
+		}
+	}()
+
+	// 1. resume the paused restored VM (exactly once). A failed Start is terminal; do not retry.
+	if err = s.hypervisor.ResumeVM(ctx); err != nil {
+		return fmt.Errorf("kata restore failed: resume: %w", err)
+	}
+
+	eps := s.network.Endpoints()
+	if len(eps) == 0 {
+		// nothing to reconcile (no CNI netns adopted); the VM is resumed and running.
+		s.Logger().Warn("restore: no adopted CNI endpoints; guest keeps its snapshot network identity")
+		return nil
+	}
+
+	// 2. capture the guest's CURRENT interfaces (the snapshotted source identity). The net_fds
+	// restore backs the SAME guest NIC with the fresh tap, but the guest kernel still holds the
+	// source MAC/IP, so we cannot select it by the target MAC. Find the sole non-loopback NIC by
+	// name and drive the agent's restore-replace path against it.
+	before, lerr := s.agent.listInterfaces(ctx)
+	if lerr != nil {
+		return fmt.Errorf("kata restore failed: list guest interfaces: %w", lerr)
+	}
+	var guestNICName string
+	guestNICCount := 0
+	for _, gi := range before {
+		if gi == nil || gi.Name == "" || gi.Name == "lo" {
+			continue
+		}
+		guestNICCount++
+		guestNICName = gi.Name
+		s.Logger().WithField("guest-iface", gi.Name).WithField("mac", gi.HwAddr).
+			Info("restore-netfds: guest NIC BEFORE identity replace")
+	}
+	if guestNICCount != 1 {
+		return fmt.Errorf("kata restore failed: expected exactly one non-loopback guest NIC, found %d", guestNICCount)
+	}
+
+	ifaces, routes, neighbors, gerr := generateVCNetworkStructures(ctx, eps)
+	if gerr != nil {
+		return fmt.Errorf("kata restore failed: generate guest network structures: %w", gerr)
+	}
+	if len(ifaces) != 1 {
+		return fmt.Errorf("kata restore failed: expected exactly one target CNI interface, found %d", len(ifaces))
+	}
+
+	// 3. restore-replace: install the target CNI identity onto the sole reused guest NIC. The agent
+	// selects the link by NAME (the guest's current name), flushes source addresses, sets the
+	// target MAC via IFLA_ADDRESS, and applies the target addrs/MTU. Networking failures are fatal.
+	target := ifaces[0]
+	targetName := target.Name // endpoint name, kept for route device remap
+	target.Name = guestNICName
+	target.Device = guestNICName
+	// TCFILTER requires the GUEST NIC mac to equal the host-side CNI veth mac, because the tc
+	// mirred redirect between the CNI veth and the tap does NOT translate MACs. Read the ACTUAL
+	// scanned veth mac (endpoint.Properties().Iface.HardwareAddr) and give the guest THAT mac.
+	// A missing/empty scanned MAC is fatal (WP4.2/B7): we must not proceed with a wrong identity.
+	props := eps[0].Properties()
+	if len(props.Iface.HardwareAddr) == 0 {
+		return fmt.Errorf("kata restore failed: adopted endpoint has no scanned CNI veth MAC")
+	}
+	target.HwAddr = props.Iface.HardwareAddr.String()
+	target.RawFlags |= kataIfaceRestoreReplace
+	s.Logger().WithField("guest-nic", guestNICName).WithField("target-mac", target.HwAddr).
+		Info("restore-netfds: applying restore-replace identity (guest mac = veth mac)")
+	if _, uerr := s.agent.updateInterface(ctx, target); uerr != nil {
+		return fmt.Errorf("kata restore failed: restore-replace interface %s: %w", guestNICName, uerr)
+	}
+
+	for _, r := range routes {
+		if r.Device == targetName {
+			r.Device = guestNICName
+		}
+	}
+	if len(routes) > 0 {
+		if _, rerr := s.agent.updateRoutes(ctx, routes); rerr != nil {
+			return fmt.Errorf("kata restore failed: install target routes: %w", rerr)
+		}
+	}
+
+	// install target ARP neighbors (WP4.5): stop discarding the generated set. Remap their device
+	// to the guest NIC name; a failure is fatal under the fail-only contract.
+	for _, n := range neighbors {
+		if n != nil && n.Device == targetName {
+			n.Device = guestNICName
+		}
+	}
+	if len(neighbors) > 0 {
+		if nerr := s.agent.addARPNeighbors(ctx, neighbors); nerr != nil {
+			return fmt.Errorf("kata restore failed: install target neighbors: %w", nerr)
+		}
+	}
+
+	// 4. read back and verify the guest NIC took the exact target identity (WP4.9): the target MAC,
+	// the required target addresses, and the ABSENCE of the source addresses.
+	after, aerr := s.agent.listInterfaces(ctx)
+	if aerr != nil {
+		return fmt.Errorf("kata restore failed: read back guest interfaces: %w", aerr)
+	}
+	// build the required target address set (address/prefix strings) and the source set to prove gone.
+	targetAddrs := map[string]struct{}{}
+	for _, a := range target.IPAddresses {
+		if a != nil && a.Address != "" {
+			targetAddrs[strings.ToLower(a.Address+"/"+a.Mask)] = struct{}{}
+		}
+	}
+	sourceAddrs := map[string]struct{}{}
+	for _, gi := range before {
+		if gi != nil && gi.Name == guestNICName {
+			for _, a := range gi.IPAddresses {
+				if a != nil && a.Address != "" {
+					sourceAddrs[strings.ToLower(a.Address+"/"+a.Mask)] = struct{}{}
+				}
+			}
+		}
+	}
+	macOK := false
+	gotAddrs := map[string]struct{}{}
+	for _, gi := range after {
+		if gi == nil || gi.Name != guestNICName {
+			continue
+		}
+		s.Logger().WithField("guest-iface", gi.Name).WithField("mac", gi.HwAddr).
+			Info("restore-netfds: guest NIC AFTER identity replace")
+		if strings.EqualFold(gi.HwAddr, target.HwAddr) {
+			macOK = true
+		}
+		for _, a := range gi.IPAddresses {
+			if a != nil && a.Address != "" {
+				gotAddrs[strings.ToLower(a.Address+"/"+a.Mask)] = struct{}{}
+			}
+		}
+	}
+	if !macOK {
+		return fmt.Errorf("kata restore failed: guest NIC %s did not take target MAC %s after restore-replace", guestNICName, target.HwAddr)
+	}
+	// every required target address must be present.
+	for want := range targetAddrs {
+		if _, ok := gotAddrs[want]; !ok {
+			return fmt.Errorf("kata restore failed: guest NIC %s missing target address %s after restore-replace", guestNICName, want)
+		}
+	}
+	// no source address may remain (unless it was also a target address).
+	for src := range sourceAddrs {
+		if _, isTarget := targetAddrs[src]; isTarget {
+			continue
+		}
+		if _, ok := gotAddrs[src]; ok {
+			return fmt.Errorf("kata restore failed: stale source address %s still present on guest NIC %s", src, guestNICName)
+		}
+	}
+
+	// identity verified: NOW activate the host-network fence (install both TC redirects, then bring
+	// the tap up as the final exposure step). Until this point the tap was down with no redirects so
+	// the stale source identity could never reach the target network. The tap + veth live inside the
+	// pod's CNI netns, so run the activation INSIDE that netns (s.network.Run -> doNetNS), matching
+	// how prepareRestoreTCFence ran during AddEndpoints.
+	if ferr := s.network.Run(ctx, func() error {
+		return activateRestoreTCFence(ctx, eps[0])
+	}); ferr != nil {
+		return fmt.Errorf("kata restore failed: activate network fence: %w", ferr)
+	}
+
+	// forwarding is live and identity verified: transition the sole adopted workload container from
+	// Ready to Running (M3). It was left Ready at CreateContainer while the VM was paused. A missing
+	// workload here is fatal (fail-only): we must not report start success while it stays Ready.
+	idx, _, ierr := soleGuestWorkloadIndex(s)
+	if ierr != nil {
+		return fmt.Errorf("kata restore failed: locate adopted workload to mark running: %w", ierr)
+	}
+	c := s.containers[s.config.Containers[idx].ID]
+	if c == nil {
+		return fmt.Errorf("kata restore failed: adopted workload container %s not registered", s.config.Containers[idx].ID)
+	}
+	if serr := c.setContainerState(types.StateRunning); serr != nil {
+		return fmt.Errorf("kata restore failed: mark adopted workload running: %w", serr)
+	}
+	if serr := s.Save(); serr != nil {
+		return fmt.Errorf("kata restore failed: persist running state after activation: %w", serr)
+	}
+	s.Logger().WithField("guest-nic", guestNICName).WithField("target-mac", target.HwAddr).
+		Info("restore-netfds: identity replace verified + forwarding activated")
+	return nil
+}
+
+// kataIfaceRestoreReplace mirrors KATA_IFACE_RESTORE_REPLACE in the rust agent (netlink.rs): a
+// raw_flags sentinel telling the agent to select the restored NIC by name and REPLACE its identity
+// (flush source addrs + set the target MAC via IFLA_ADDRESS + apply target addrs). MUST match.
+const kataIfaceRestoreReplace uint32 = 0x4000_0000
 
 // adoptPauseContainer builds the host-side *Container for the restored sandbox's pause
 // container (id == sandbox id == newID after seedPersist re-keyed it) and registers it in
@@ -343,7 +537,11 @@ func adoptPauseContainer(ctx context.Context, s *Sandbox, newID, origSandboxID s
 			return fmt.Errorf("get pause container spec: %w", err)
 		}
 		cc.CustomSpec = &spec
-		c, err := newContainer(ctx, s, cc)
+		// host-only adoption for the pause container too (HANDOFF D2): the pause container is
+		// already live in the restored guest, so use the adoption constructor which skips
+		// createMounts/createDevices/guest-create. newContainer would risk those side effects when
+		// the per-container persist state map is empty.
+		c, err := newAdoptedContainer(ctx, s, cc)
 		if err != nil {
 			return fmt.Errorf("new pause container: %w", err)
 		}
@@ -369,54 +567,143 @@ func adoptPauseContainer(ctx context.Context, s *Sandbox, newID, origSandboxID s
 }
 
 // RestoreContainer adopts an APP container that is ALREADY LIVE in the restored guest into the
-// host-side sandbox, WITHOUT creating it in the guest. It is the restore-path counterpart of
-// Sandbox.CreateContainer: same config-append + newContainer + addContainer bookkeeping, but it
-// SKIPS c.create() (the guest agent CreateContainer RPC) -- the container's processes are
-// already running from the snapshot, and re-creating would collide with them and trip guest
-// gates (e.g. the Guest-SELinux host/guest mismatch). The container is marked Running so the
-// shim's Start/IOStream path accepts it. This is the T5 per-container "name-keyed adopt/no-op"
-// the CRI two-phase (CreateContainer/StartContainer) lands on for a restored pod.
+// host-side sandbox, WITHOUT creating it in the guest. It is a HOST-ONLY adoption: it replaces the
+// sole persisted workload config with the incoming target config, builds the Container via an
+// adoption-only constructor (no createMounts/createDevices, no guest CreateContainer RPC -- the
+// container's processes are already running from the snapshot), and marks it Ready (NOT Running)
+// while the VM is still paused. It is marked Running only later, after a successful StartContainer.
+//
+// First-slice contract (WP3/§7.3): exactly ONE workload container. The incoming containerd workload
+// is correlated POSITIONALLY to the sole persisted guest workload; its OCI spec, image, command,
+// mounts, and credentials are NOT compared. The restore caller guarantees workload compatibility;
+// Kata only adopts the sole persisted guest container. A hook-bearing workload is rejected.
 func (s *Sandbox) RestoreContainer(ctx context.Context, contConfig ContainerConfig) (VCContainer, error) {
-	// the guest knows this container by its ORIGINAL snapshot id, not the fresh containerd id
-	// in contConfig.ID. the original app-container id is the one non-sandbox, non-pause entry the
-	// snapshot's persisted config carried (seedPersist re-keyed ONLY the pause entry to newID, so
-	// the app entry still holds its original id). find it so agent-facing ops (waitProcess, ...)
-	// target the live guest container instead of missing on the clone id.
-	guestID := restoreGuestContainerID(s, contConfig.ID)
+	// reject hook-bearing workloads for the first slice (before any host mutation).
+	if spec := contConfig.CustomSpec; spec != nil && spec.Hooks != nil {
+		h := spec.Hooks
+		if len(h.Prestart) > 0 || len(h.CreateRuntime) > 0 || len(h.CreateContainer) > 0 ||
+			len(h.StartContainer) > 0 || len(h.Poststart) > 0 || len(h.Poststop) > 0 {
+			return nil, fmt.Errorf("kata restore failed: workload declares OCI hooks, which are not supported by the first restore slice")
+		}
+	}
 
-	s.config.Containers = append(s.config.Containers, contConfig)
-	var err error
+	// locate the EXACTLY-one persisted workload config and its ORIGINAL guest-known id. The guest
+	// keys this container by its snapshot id, not the fresh containerd id in contConfig.ID, so
+	// agent-facing ops (waitProcess, signal) must target guestID. No fallback to the clone id.
+	idx, guestID, err := soleGuestWorkloadIndex(s)
+	if err != nil {
+		return nil, err
+	}
+	if guestID == "" {
+		return nil, fmt.Errorf("kata restore failed: persisted workload has an empty guest id")
+	}
+
+	// reject a SECOND workload adoption (HANDOFF D3): if a non-pause workload container is already
+	// registered, a repeat Create must not replace the mapping again or leave two host containers.
+	for id, c := range s.containers {
+		if c == nil || id == s.id {
+			continue
+		}
+		if c.config == nil || c.config.Annotations[criContainerTypeAnnotation] != criSandboxType {
+			return nil, fmt.Errorf("kata restore failed: a workload container is already adopted; refusing a second adoption")
+		}
+	}
+
+	// REPLACE the saved workload config in place with the incoming target config (M2): do not keep
+	// both the source and the target copies. Preserve the original entry for rollback on error.
+	savedCopy := s.config.Containers[idx]
+	s.config.Containers[idx] = contConfig
+	rollback := true
 	defer func() {
-		if err != nil && len(s.config.Containers) > 0 {
-			s.config.Containers = s.config.Containers[:len(s.config.Containers)-1]
+		if rollback {
+			s.config.Containers[idx] = savedCopy
 		}
 	}()
 
-	c, err := newContainer(ctx, s, &s.config.Containers[len(s.config.Containers)-1])
+	// adoption-only constructor: common in-memory bookkeeping, NO createMounts/createDevices and NO
+	// guest CreateContainer. The container is already live in the restored guest.
+	c, err := newAdoptedContainer(ctx, s, &s.config.Containers[idx])
 	if err != nil {
 		return nil, err
 	}
 	// c.id == contConfig.ID (the containerd/clone id) for host-side lookups (findContainer,
 	// IOStream). c.guestID == the original id for agent RPCs. the guest keys the init process by
-	// exec-id == guest container id (kata_agent createContainer), so the process token is guestID.
+	// exec-id == guest container id, so the process token is guestID.
 	c.guestID = guestID
 	c.process = Process{Token: guestID, Pid: -1}
-	// NO c.create(ctx): the container is already live in the restored guest.
 	if err = s.addContainer(c); err != nil {
 		return nil, err
 	}
-	if err = c.setContainerState(types.StateRunning); err != nil {
-		return nil, err
+	// Ready, NOT Running: the VM is still paused; the container is marked Running only after a
+	// successful StartContainer resumes and verifies the VM (M3). setContainerState persists the
+	// sandbox (which now carries the adopted target-ID -> guest-ID mapping via the container's
+	// guestID/Process.Token), so no separate Save is needed here (WP3.11).
+	if err = c.setContainerState(types.StateReady); err != nil {
+		// undo the addContainer on failure so we never leave a half-adopted container.
+		delete(s.containers, c.id)
+		return nil, fmt.Errorf("kata restore failed: persist adopted container mapping: %w", err)
+	}
+	rollback = false
+	return c, nil
+}
+
+// newAdoptedContainer builds the host-side *Container for a restored workload WITHOUT any guest or
+// device side effects. It mirrors the in-memory bookkeeping of newContainer (id/guestID/sandbox/
+// rootfs/config/paths/mounts) but deliberately SKIPS createMounts, createDevices, and c.Restore():
+// the container's rootfs and processes are already live in the restored guest, so mounting or
+// device-plugging on the host would be wrong, and there is no per-container persist to restore yet
+// (RestoreContainer writes it). Swappiness/swap annotations are honored to match newContainer.
+func newAdoptedContainer(ctx context.Context, sandbox *Sandbox, contConfig *ContainerConfig) (*Container, error) {
+	if !contConfig.valid() {
+		return nil, fmt.Errorf("kata restore failed: invalid adopted container configuration")
+	}
+	c := &Container{
+		id:            contConfig.ID,
+		guestID:       contConfig.ID,
+		sandboxID:     sandbox.id,
+		rootFs:        contConfig.RootFs,
+		config:        contConfig,
+		sandbox:       sandbox,
+		containerPath: filepath.Join(sandbox.id, contConfig.ID),
+		rootfsSuffix:  "rootfs",
+		state:         types.ContainerState{},
+		process:       Process{},
+		mounts:        contConfig.Mounts,
+		ctx:           sandbox.ctx,
+	}
+	if resourceSwappinessStr, ok := c.config.Annotations[vcAnnotations.ContainerResourcesSwappiness]; ok {
+		resourceSwappiness, perr := strconv.ParseUint(resourceSwappinessStr, 0, 64)
+		if perr == nil && resourceSwappiness > 200 {
+			perr = fmt.Errorf("swappiness should not be bigger than 200")
+		}
+		if perr != nil {
+			return nil, fmt.Errorf("kata restore failed: invalid swappiness annotation: %w", perr)
+		}
+		if c.config.Resources.Memory == nil {
+			c.initConfigResourcesMemory()
+		}
+		c.config.Resources.Memory.Swappiness = &resourceSwappiness
+	}
+	if resourceSwapInBytesStr, ok := c.config.Annotations[vcAnnotations.ContainerResourcesSwapInBytes]; ok {
+		v, perr := strconv.ParseUint(resourceSwapInBytesStr, 0, 64)
+		if perr != nil {
+			return nil, fmt.Errorf("kata restore failed: invalid swap-in-bytes annotation: %w", perr)
+		}
+		if c.config.Resources.Memory == nil {
+			c.initConfigResourcesMemory()
+		}
+		swap := int64(v)
+		c.config.Resources.Memory.Swap = &swap
 	}
 	return c, nil
 }
 
-// restoreGuestContainerID returns the original (guest-known) container id for the app container
-// being adopted. The snapshot's persisted config (now in s.config.Containers, minus the pause
-// entry which seedPersist re-keyed) carries the original app-container id; there is exactly one
-// non-pause app container in the demo pods. If none is found (unexpected), fall back to the
-// clone id -- the adopt still registers host-side, only guest waitProcess would miss.
-func restoreGuestContainerID(s *Sandbox, cloneID string) string {
+// soleGuestWorkloadIndex returns the index in s.config.Containers of the single persisted workload
+// container and its ORIGINAL guest-known id, erroring unless there is EXACTLY one non-pause,
+// non-sandbox workload entry. There is NO fallback to the clone id.
+func soleGuestWorkloadIndex(s *Sandbox) (int, string, error) {
+	idx := -1
+	count := 0
 	for i := range s.config.Containers {
 		cc := &s.config.Containers[i]
 		// skip the pause/sandbox container (already re-keyed to the sandbox id == s.id)
@@ -426,9 +713,33 @@ func restoreGuestContainerID(s *Sandbox, cloneID string) string {
 		if cc.Annotations[criContainerTypeAnnotation] == criSandboxType {
 			continue
 		}
-		return cc.ID
+		count++
+		idx = i
 	}
-	return cloneID
+	switch count {
+	case 1:
+		return idx, s.config.Containers[idx].ID, nil
+	case 0:
+		return -1, "", fmt.Errorf("kata restore failed: no persisted workload container found in snapshot (expected exactly one)")
+	default:
+		return -1, "", fmt.Errorf("kata restore failed: snapshot has %d workload containers; the first restore slice supports exactly one", count)
+	}
+}
+
+// snapshotHypervisorType reads the persisted hypervisor type from the snapshot's persist.json
+// WITHOUT mutating any restore-side state, so a non-CLH snapshot can be rejected before
+// seedPersist writes the store. mirrors the field loadSandboxConfig later maps into
+// SandboxConfig.HypervisorType (persist SandboxConfig.HypervisorType).
+func snapshotHypervisorType(snapshotDir string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(snapshotDir, "persist.json"))
+	if err != nil {
+		return "", fmt.Errorf("read snapshot persist.json: %w", err)
+	}
+	var ss persistapi.SandboxState
+	if err := json.Unmarshal(raw, &ss); err != nil {
+		return "", fmt.Errorf("decode snapshot persist.json: %w", err)
+	}
+	return ss.Config.HypervisorType, nil
 }
 
 // seedPersist loads the snapshot's persist.json, rewrites the sandbox identity to newID,
@@ -516,251 +827,6 @@ const (
 	containerdBundleBase       = "/run/containerd/io.containerd.runtime.v2.task/k8s.io"
 )
 
-// applyRestoreNetwork configures the restored guest's CNI networking. It reuses the
-// SAME structures the fresh-boot path builds (generateVCNetworkStructures over the adopted CNI
-// endpoints, which carry the real pod IP/routes captured by AddEndpoints), but AVOIDS renaming
-// guest interfaces: it matches each generated interface to the guest's CURRENT interface name by
-// MAC and uses that name, so the agent's update_interface only ADDS the pod IP (no rename dance,
-// which collides with the frozen snapshot NIC that also holds "eth0"). The guest keeps its own
-// device names (e.g. the CNI NIC stays eth1); functionally correct, and collision-free.
-func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
-	// perf: NETWORK sub-phase timer (guestReIP / routeInstall / neutralizeNIC).
-	nt := newPhaseTimer("NETWORK", s.id, virtLog)
-	defer nt.summary()
-
-	eps := s.network.Endpoints()
-	if len(eps) == 0 {
-		return fmt.Errorf("no CNI endpoints adopted; nothing to configure")
-	}
-
-	// what does the guest currently look like? map MAC -> current guest iface name, so we can
-	// re-IP in place WITHOUT triggering a rename (rename collides with the frozen snapshot NIC).
-	before, lerr := s.agent.listInterfaces(ctx)
-	if lerr != nil {
-		return fmt.Errorf("list guest interfaces: %w", lerr)
-	}
-	macToGuestName := map[string]string{}
-	for _, gi := range before {
-		if gi != nil && gi.HwAddr != "" {
-			macToGuestName[strings.ToUpper(gi.HwAddr)] = gi.Name
-		}
-	}
-
-	ifaces, routes, _, gerr := generateVCNetworkStructures(ctx, eps)
-	if gerr != nil {
-		return fmt.Errorf("generate guest network structures: %w", gerr)
-	}
-
-	// re-IP each CNI NIC in place. rewrite Name/Device to the guest's CURRENT name for that MAC
-	// so update_interface (which matches by HwAddr) adds the address without renaming.
-	epNames := map[string]string{} // endpoint-name -> guest-name, for route device remap below
-	for _, ifc := range ifaces {
-		guestName, ok := macToGuestName[strings.ToUpper(ifc.HwAddr)]
-		if !ok {
-			s.Logger().WithField("mac", ifc.HwAddr).Warn("restore: CNI NIC mac not present in guest; skipping re-IP")
-			continue
-		}
-		epNames[ifc.Name] = guestName
-		ifc.Name = guestName
-		ifc.Device = guestName
-		if _, uerr := s.agent.updateInterface(ctx, ifc); uerr != nil {
-			return fmt.Errorf("updateInterface %s (mac %s): %w", guestName, ifc.HwAddr, uerr)
-		}
-	}
-	s.Logger().WithField("restore-net", "interfaces-applied").WithField("count", len(ifaces)).Info("restore: CNI interfaces configured")
-	// perf: guest re-IP of the adopted CNI NICs (the updateInterface RPCs).
-	nt.phase("guestReIP")
-
-	// install routes. updateRoutes matches the link by DEVICE NAME, so remap each route's Device
-	// from the endpoint name to the guest's actual iface name.
-	for _, r := range routes {
-		if gn, ok := epNames[r.Device]; ok {
-			r.Device = gn
-		}
-	}
-	if len(routes) > 0 {
-		if _, rerr := s.agent.updateRoutes(ctx, routes); rerr != nil {
-			return fmt.Errorf("updateRoutes: %w", rerr)
-		}
-		s.Logger().WithField("restore-net", "routes-applied").WithField("count", len(routes)).Info("restore: CNI routes installed")
-	}
-
-	// #2 isolation-via-routing: the FROZEN snapshot NIC still holds an on-link route for the
-	// pod subnet (e.g. 10.244.0.0/16 dev eth0) baked into guest RAM -- it competes with the CNI
-	// NIC's route and, because eth0's dead tap can't carry traffic, black-holes the clone. the
-	// agent's update_routes uses NLM_F_REPLACE, so re-asserting the subnet + default routes
-	// pinned to the CNI guest NIC (by device name) OVERRIDES the frozen ones onto the live NIC.
-	// build override routes from each CNI interface's own address/subnet.
-	var overrides []*pbTypes.Route
-	for _, ifc := range ifaces {
-		guestName, ok := macToGuestName[strings.ToUpper(ifc.HwAddr)]
-		if !ok {
-			continue
-		}
-		for _, a := range ifc.IPAddresses {
-			if a == nil || a.Family != pbTypes.IPFamily_v4 || a.Address == "" || a.Mask == "" {
-				continue
-			}
-			// on-link subnet route for this NIC's network, pinned to the live CNI NIC.
-			if sub := subnetCIDR(a.Address, a.Mask); sub != "" {
-				overrides = append(overrides, &pbTypes.Route{
-					Dest:   sub,
-					Device: guestName,
-					Scope:  253, // RT_SCOPE_LINK
-					Family: pbTypes.IPFamily_v4,
-				})
-			}
-		}
-	}
-	if len(overrides) > 0 {
-		if _, rerr := s.agent.updateRoutes(ctx, overrides); rerr != nil {
-			s.Logger().WithError(rerr).Warn("restore: subnet-override routes failed (frozen NIC route may still shadow)")
-		} else {
-			s.Logger().WithField("restore-net", "override-routes").WithField("count", len(overrides)).Info("restore: pinned pod-subnet route to CNI NIC (frozen-NIC isolation)")
-		}
-	}
-	// perf: install CNI routes + pin pod-subnet override routes to the live NIC.
-	nt.phase("routeInstall")
-
-	// isolation: neutralize the frozen snapshot NIC (the source pod's identity baked into the
-	// clone's RAM). any guest iface whose MAC is NOT owned by an adopted CNI endpoint is the
-	// frozen one; the (rebuilt) agent downs it + flushes its addresses so the clone shares no
-	// mac/ip/route with its source. this is what makes TCP + egress work (the frozen NIC's stale
-	// /16 route otherwise black-holes) AND delivers complete isolation.
-	neutralizeFrozenNIC(ctx, s, before, eps)
-	// perf: down + flush the frozen snapshot NIC (clone isolation).
-	nt.phase("neutralizeNIC")
-
-	return nil
-}
-
-// subnetCIDR returns the network CIDR for an ipv4 address + prefix-length string, e.g.
-// ("10.244.0.204", "16") -> "10.244.0.0/16". empty on parse failure.
-func subnetCIDR(addr, maskLen string) string {
-	prefix, err := strconv.Atoi(maskLen)
-	if err != nil || prefix < 0 || prefix > 32 {
-		return ""
-	}
-	ip := net.ParseIP(addr)
-	if ip == nil || ip.To4() == nil {
-		return ""
-	}
-	mask := net.CIDRMask(prefix, 32)
-	network := ip.Mask(mask)
-	return fmt.Sprintf("%s/%d", network.String(), prefix)
-}
-
-// neutralizeFrozenNIC downs + flushes the FROZEN snapshot NIC so a restored clone shares NO
-// network identity with its source (the original pod's MAC + stale pod IP + its /16 route must
-// not survive in the clone, or they leak identity and can black-hole the clone's own subnet
-// route). The frozen NIC is any guest interface (from the pre-reconfig `before` list) whose MAC
-// is NOT owned by an adopted CNI endpoint and which is not loopback. Best-effort: never fatal.
-func neutralizeFrozenNIC(ctx context.Context, s *Sandbox, before []*pbTypes.Interface, eps []Endpoint) {
-	// set of CNI-owned MACs (upper-cased for comparison; agent reports MACs upper-case).
-	cniMACs := map[string]struct{}{}
-	for _, ep := range eps {
-		cniMACs[strings.ToUpper(ep.HardwareAddr())] = struct{}{}
-	}
-	for _, ifc := range before {
-		if ifc == nil || ifc.Name == "lo" || ifc.HwAddr == "" {
-			continue
-		}
-		mac := strings.ToUpper(ifc.HwAddr)
-		if _, isCNI := cniMACs[mac]; isCNI {
-			continue // a CNI NIC -- keep it
-		}
-		// this is the frozen snapshot NIC. neutralize it: send updateInterface with the
-		// KATA_IFACE_NEUTRALIZE sentinel in RawFlags, which the (rebuilt) guest agent handles by
-		// DOWNING the link + DELETING all its addresses -- so its stale pod IP + on-link /16
-		// route go away, leaving the clone with only its own CNI identity (complete isolation).
-		// requires the guest to run the neutralize-capable agent (baked into fresh snapshots).
-		down := &pbTypes.Interface{
-			Device:      ifc.Name,
-			Name:        ifc.Name,
-			HwAddr:      ifc.HwAddr,
-			Mtu:         ifc.Mtu,
-			RawFlags:    kataIfaceNeutralize,
-			IPAddresses: nil,
-		}
-		if _, err := s.agent.updateInterface(ctx, down); err != nil {
-			s.Logger().WithError(err).WithField("frozen-nic", ifc.Name).WithField("mac", ifc.HwAddr).Warn("restore: could not neutralize frozen snapshot NIC (isolation best-effort)")
-			continue
-		}
-		s.Logger().WithField("frozen-nic", ifc.Name).WithField("mac", ifc.HwAddr).Info("restore: neutralized frozen snapshot NIC for clone isolation")
-	}
-}
-
-// setupRestoreNetwork is the best-effort host-tap + agent re-IP for a restored clone.
-func setupRestoreNetwork(ctx context.Context, s *Sandbox, snapshotDir, guestIPCIDR string) error {
-	net, err := allocateCloneNet()
-	if err != nil {
-		return err
-	}
-	if guestIPCIDR != "" {
-		net.guestIP = guestIPCIDR
-	}
-	if err := setupTap(net); err != nil {
-		return err
-	}
-
-	mac, err := readSnapshotMAC(snapshotDir)
-	if err != nil {
-		return err
-	}
-	addr, mask := splitCIDR(net.guestIP)
-	ifc := &pbTypes.Interface{
-		Device: "eth0",
-		Name:   "eth0",
-		Mtu:    1500,
-		HwAddr: mac,
-		IPAddresses: []*pbTypes.IPAddress{{
-			Family:  pbTypes.IPFamily_v4,
-			Address: addr,
-			Mask:    mask,
-		}},
-	}
-	if _, err := s.agent.updateInterface(ctx, ifc); err != nil {
-		return fmt.Errorf("agent updateInterface: %w", err)
-	}
-	return nil
-}
-
-// readSnapshotMAC pulls .net[0].mac out of the snapshot's config.json. the clone reuses
-// the original MAC; a fresh MAC is deferred until dup-MAC actually bites.
-func readSnapshotMAC(snapshotDir string) (string, error) {
-	raw, err := os.ReadFile(filepath.Join(snapshotDir, "config.json"))
-	if err != nil {
-		return "", err
-	}
-	var cfg struct {
-		Net []struct {
-			Mac string `json:"mac"`
-		} `json:"net"`
-	}
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return "", err
-	}
-	if len(cfg.Net) == 0 || cfg.Net[0].Mac == "" {
-		return "", fmt.Errorf("snapshot config.json: .net[0].mac missing")
-	}
-	return cfg.Net[0].Mac, nil
-}
-
-// ---- networking helpers (best-effort, copied from cmd/kata-runtime/restore.go --
-// different package, so not importable). ----
-
-const (
-	tapPrefix     = "kat"
-	tapSubnetBase = 240 // 192.168.240.x for clone 0, .241 for clone 1, ...
-	maxClones     = 15
-)
-
-type cloneNet struct {
-	tap     string
-	hostIP  string // CIDR
-	guestIP string // CIDR
-}
-
 // genCloneID returns name if given, else a random clone-<hex> id.
 func genCloneID(name string) string {
 	if name != "" {
@@ -782,56 +848,6 @@ func validateSandboxID(id string) error {
 	}
 	if id == "." || id == ".." || strings.ContainsAny(id, "/\\") || strings.Contains(id, "..") {
 		return fmt.Errorf("invalid sandbox id %q: must not contain path separators or ..", id)
-	}
-	return nil
-}
-
-// allocateCloneNet atomically claims a free tap slot (ip tuntap add fails if the device
-// exists) and derives its point-to-point subnet.
-func allocateCloneNet() (cloneNet, error) {
-	for n := 0; n < maxClones; n++ {
-		tap := fmt.Sprintf("%s%d", tapPrefix, n)
-		if err := runIP("tuntap", "add", "mode", "tap", tap); err != nil {
-			continue
-		}
-		octet := tapSubnetBase + n
-		return cloneNet{
-			tap:     tap,
-			hostIP:  fmt.Sprintf("192.168.%d.2/24", octet),
-			guestIP: fmt.Sprintf("192.168.%d.1/24", octet),
-		}, nil
-	}
-	return cloneNet{}, fmt.Errorf("no free clone tap slot (all %d in use)", maxClones)
-}
-
-// setupTap brings an allocated tap up and assigns the host IP + a /32 route to the guest.
-func setupTap(net cloneNet) error {
-	guestAddr, _ := splitCIDR(net.guestIP)
-	for _, args := range [][]string{
-		{"link", "set", "dev", net.tap, "up"},
-		{"a", "add", net.hostIP, "dev", net.tap},
-		{"route", "add", guestAddr + "/32", "dev", net.tap},
-	} {
-		if err := runIP(args...); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// splitCIDR splits "192.168.240.1/24" into ("192.168.240.1", "24").
-func splitCIDR(cidr string) (addr, mask string) {
-	if i := strings.IndexByte(cidr, '/'); i >= 0 {
-		return cidr[:i], cidr[i+1:]
-	}
-	return cidr, ""
-}
-
-// runIP shells out to `ip` (matches the exec.Command("ip",...) precedent in
-// network_linux.go).
-func runIP(args ...string) error {
-	if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("ip %s: %s (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

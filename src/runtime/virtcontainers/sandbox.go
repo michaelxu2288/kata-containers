@@ -261,6 +261,12 @@ type Sandbox struct {
 	// multiple times for hot-plugged network device when Sandbox has multiple
 	// containers.
 	hotplugNetworkConfigApplied bool
+
+	// restoreNetFence, when true, makes the endpoint attach path prepare the tap DOWN with no TC
+	// redirects (the net_fds restore fence) instead of the normal setupTCFiltering. Set only on the
+	// annotation-restore path before AddEndpoints; the redirects are installed later by
+	// FinalizeRestoreNetwork after guest identity verification.
+	restoreNetFence bool
 }
 
 // ID returns the sandbox identifier string.

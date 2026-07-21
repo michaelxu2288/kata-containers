@@ -8,6 +8,7 @@ package virtcontainers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -41,6 +42,12 @@ type VMConfig struct {
 	HypervisorType   HypervisorType
 	AgentConfig      KataAgentConfig
 	HypervisorConfig HypervisorConfig
+
+	// RestoreNetEndpoints carries the adopted CNI endpoints whose host tap FDs must back the
+	// EXISTING restored guest NIC via CLH vm.restore net_fds. Set only on the annotation-restore
+	// path; nil on normal boot and template restore. NOT serialized (live tap FD handles cannot
+	// cross ToGrpc/persist), so it is excluded from the gRPC/JSON forms.
+	RestoreNetEndpoints []Endpoint `json:"-"`
 }
 
 func (c *VMConfig) Valid() error {
@@ -135,6 +142,18 @@ func newVM(ctx context.Context, config VMConfig, restoreSnapshotDir string) (*VM
 		return nil, err
 	}
 
+	// H2 stop/reap ownership must be installed HERE, right after CreateVM launches the VMM, not
+	// after RestoreVM/StartVM returns. Otherwise a config/request/non-Paused failure inside
+	// RestoreVM (or StartVM) would orphan the launched hypervisor process while newVM returns no
+	// *VM to the caller (HANDOFF B1). This defer reaps the actual launched hypervisor on any later
+	// error in this function.
+	defer func() {
+		if err != nil {
+			virtLog.WithField("vm", id).WithError(err).Info("clean up vm")
+			hypervisor.StopVM(ctx, false)
+		}
+	}()
+
 	// 2. setup agent
 	newAagentFunc := getNewAgentFunc(ctx)
 	agent := newAagentFunc()
@@ -151,6 +170,18 @@ func newVM(ctx context.Context, config VMConfig, restoreSnapshotDir string) (*VM
 
 	// 3. boot up (or restore) the guest vm
 	if restoreSnapshotDir != "" {
+		// stage the adopted CNI endpoints' tap FDs onto the hypervisor so RestoreVM can back the
+		// EXISTING guest NIC via net_fds instead of hotplugging a second NIC. CLH-only; a no-op
+		// for other hypervisors and when no endpoints were passed.
+		if len(config.RestoreNetEndpoints) > 0 {
+			if clh, ok := hypervisor.(*cloudHypervisor); ok {
+				if err = clh.stageRestoreNet(config.RestoreNetEndpoints); err != nil {
+					return nil, fmt.Errorf("stage restore net_fds: %w", err)
+				}
+			} else {
+				virtLog.WithField("vm", id).Warn("restore net_fds requested but hypervisor is not cloud-hypervisor; ignoring")
+			}
+		}
 		if err = hypervisor.RestoreVM(ctx, restoreSnapshotDir); err != nil {
 			return nil, err
 		}
@@ -159,13 +190,6 @@ func newVM(ctx context.Context, config VMConfig, restoreSnapshotDir string) (*VM
 			return nil, err
 		}
 	}
-
-	defer func() {
-		if err != nil {
-			virtLog.WithField("vm", id).WithError(err).Info("clean up vm")
-			hypervisor.StopVM(ctx, false)
-		}
-	}()
 
 	// 4. Check agent aliveness
 	// Restored VMs (e.g. clones from a template) are paused, do not Check

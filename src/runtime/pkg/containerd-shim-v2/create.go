@@ -246,43 +246,43 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 			return nil, fmt.Errorf("BUG: Cannot start the container, since the sandbox hasn't been created")
 		}
 
-		if rootFs.Mounted, err = checkAndMount(s, r); err != nil {
-			return nil, err
-		}
-
-		defer func() {
-			if err != nil && rootFs.Mounted {
-				if err2 := mount.UnmountAll(rootfs, 0); err2 != nil {
-					shimLog.WithField("container-type", containerType).WithError(err2).Warn("failed to cleanup rootfs mount")
-				}
-			}
-		}()
-
-		// CDI annotations have been processed during PodSandbox creation
-		// and cold-plug. CDI annotations referencing device kinds that
-		// exist in the guest (e.g., nvidia.com/gpu) will be generated
-		// during device attachment.
-		removeCDIAnnotations(ociSpec.Annotations)
-
 		if s.restoredSandbox {
-			// T5: on a restored sandbox the app container is ALREADY LIVE in the guest (it came
-			// back with the snapshot). kubelet still issues CreateContainer per-container, but we
-			// must ADOPT the guest-live container (host-side bookkeeping only), NOT re-create it
-			// in the guest -- a fresh guest create would collide with the running process and trip
-			// guest gates (e.g. the Guest-SELinux host/guest mismatch). Build the same
-			// ContainerConfig katautils.CreateContainer would, then adopt via RestoreContainer.
+			// WP3/M1: on a restored sandbox the workload container is ALREADY LIVE in the guest (it
+			// came back with the snapshot). Adoption is HOST-ONLY: branch BEFORE checkAndMount and
+			// before any rootfs/device/guest-create work. A fresh mount+guest create would collide
+			// with the running process and trip guest gates (e.g. Guest-SELinux host/guest
+			// mismatch). Build the same ContainerConfig katautils.CreateContainer would (for host
+			// bookkeeping), but pass the un-mounted rootfs and adopt via RestoreContainer, which
+			// performs no createMounts/createDevices and no guest CreateContainer.
+			removeCDIAnnotations(ociSpec.Annotations)
 			contConfig, cerr := oci.ContainerConfig(*ociSpec, bundlePath, r.ID, disableOutput)
 			if cerr != nil {
 				err = cerr
 				return nil, err
 			}
-			if !rootFs.Mounted {
-				contConfig.RootFs = rootFs
-			}
+			contConfig.RootFs = rootFs // not mounted; adoption skips mount/device setup
 			if _, err = s.sandbox.RestoreContainer(ctx, contConfig); err != nil {
 				return nil, err
 			}
 		} else {
+			if rootFs.Mounted, err = checkAndMount(s, r); err != nil {
+				return nil, err
+			}
+
+			defer func() {
+				if err != nil && rootFs.Mounted {
+					if err2 := mount.UnmountAll(rootfs, 0); err2 != nil {
+						shimLog.WithField("container-type", containerType).WithError(err2).Warn("failed to cleanup rootfs mount")
+					}
+				}
+			}()
+
+			// CDI annotations have been processed during PodSandbox creation
+			// and cold-plug. CDI annotations referencing device kinds that
+			// exist in the guest (e.g., nvidia.com/gpu) will be generated
+			// during device attachment.
+			removeCDIAnnotations(ociSpec.Annotations)
+
 			_, err = katautils.CreateContainer(ctx, s.sandbox, *ociSpec, rootFs, r.ID, bundlePath, disableOutput, runtimeConfig.DisableGuestEmptyDir)
 			if err != nil {
 				return nil, err
