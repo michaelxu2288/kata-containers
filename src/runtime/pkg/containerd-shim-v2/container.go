@@ -37,7 +37,7 @@ type container struct {
 	status      task.Status
 	terminal    bool
 	mounted     bool
-	// restorePauseIOArmPending defers pause-task IO until the restored VM resumes.
+
 	restorePauseIOArmPending bool
 }
 

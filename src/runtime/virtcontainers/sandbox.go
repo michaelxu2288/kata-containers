@@ -262,7 +262,6 @@ type Sandbox struct {
 	// containers.
 	hotplugNetworkConfigApplied bool
 
-	// restoreNetFence delays TC redirects until the restored guest identity is replaced.
 	restoreNetFence bool
 }
 
@@ -1062,6 +1061,16 @@ func (s *Sandbox) removeNetwork(ctx context.Context) error {
 	span, ctx := katatrace.Trace(ctx, s.Logger(), "removeNetwork", sandboxTracingTags, map[string]string{"sandbox_id": s.id})
 	defer span.End()
 
+	if s.restoreNetFence {
+		if err := s.network.Run(ctx, func() error {
+			for _, ep := range s.network.Endpoints() {
+				cleanupRestoreTCFence(ep)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	return s.network.RemoveEndpoints(ctx, s, nil, false)
 }
 
