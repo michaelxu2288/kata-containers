@@ -1,6 +1,6 @@
 # Annotation-restore performance
 
-Per-phase timing of the annotation restore path (`restore_from` pod annotation ->
+Per-phase timing of the annotation restore path (`restore-from` pod annotation ->
 `RunPodSandbox` -> `vc.RestoreSandbox`), measured with the Go `time`-based phase timers
 added in this change. Counter workload, MSHV + EROFS, Cloud Hypervisor, 2 GB snapshot.
 

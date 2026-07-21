@@ -64,7 +64,6 @@ func startContainer(ctx context.Context, s *service, c *container) (retErr error
 			if err != nil {
 				return err
 			}
-		} else {
 		}
 	}
 

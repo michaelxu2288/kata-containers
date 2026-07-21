@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -49,11 +48,6 @@ type RestoreOpts struct {
 	HypervisorPath string
 	KernelPath     string
 	ImagePath      string
-
-	// optional CIDR (e.g. "192.168.240.1/24"); when set, best-effort host tap + agent
-	// re-IP so the guest gets a fresh non-colliding address. empty skips networking (the
-	// sandbox is still real + managed, just not reachable on a new IP).
-	GuestIP string
 
 	// path to the pod's CNI network namespace (e.g. /var/run/netns/cni-<id>), read by the
 	// shim from the LIVE OCI spec (containerd ran CNI ADD during RunPodSandbox). when set, the
@@ -271,18 +265,11 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	// perf: attach VM to sandbox + rehydrate pause-container identity.
 	rt.phase("assign")
 
-	// best-effort networking, only when a guest IP was requested; never fatal.
-	if opts.GuestIP != "" {
-		if nerr := setupRestoreNetwork(ctx, s, snapshotDir, opts.GuestIP); nerr != nil {
-			s.Logger().WithError(nerr).Warn("restore: best-effort networking failed; sandbox is up but may not be reachable on the new IP")
-		}
-	}
-
 	// un-pause the guest.
 	if err = vm.Resume(ctx); err != nil {
 		return nil, fmt.Errorf("resume restored vm: %w", err)
 	}
-	// perf: best-effort CLI-networking (if any) + guest resume.
+	// perf: guest resume.
 	rt.phase("resume")
 
 	// bind the CNI tap to the now-running restored VM. the coldplug above staged the
@@ -374,7 +361,7 @@ func adoptPauseContainer(ctx context.Context, s *Sandbox, newID, origSandboxID s
 // SKIPS c.create() (the guest agent CreateContainer RPC) -- the container's processes are
 // already running from the snapshot, and re-creating would collide with them and trip guest
 // gates (e.g. the Guest-SELinux host/guest mismatch). The container is marked Running so the
-// shim's Start/IOStream path accepts it. This is the T5 per-container "name-keyed adopt/no-op"
+// shim's Start/IOStream path accepts it. This is the per-container "name-keyed adopt/no-op"
 // the CRI two-phase (CreateContainer/StartContainer) lands on for a restored pod.
 func (s *Sandbox) RestoreContainer(ctx context.Context, contConfig ContainerConfig) (VCContainer, error) {
 	// the guest knows this container by its ORIGINAL snapshot id, not the fresh containerd id
@@ -413,9 +400,11 @@ func (s *Sandbox) RestoreContainer(ctx context.Context, contConfig ContainerConf
 
 // restoreGuestContainerID returns the original (guest-known) container id for the app container
 // being adopted. The snapshot's persisted config (now in s.config.Containers, minus the pause
-// entry which seedPersist re-keyed) carries the original app-container id; there is exactly one
-// non-pause app container in the demo pods. If none is found (unexpected), fall back to the
-// clone id -- the adopt still registers host-side, only guest waitProcess would miss.
+// entry which seedPersist re-keyed) carries the original app-container id; this assumes exactly
+// one non-pause app container (true for the demo pods). TODO(multi-container): a pod with >1 app
+// container needs per-container correlation via persist.json<->OCI-spec matching (deferred design
+// item); today every app container would map to this first id. If none is found (unexpected),
+// fall back to the clone id -- the adopt still registers host-side, only guest waitProcess would miss.
 func restoreGuestContainerID(s *Sandbox, cloneID string) string {
 	for i := range s.config.Containers {
 		cc := &s.config.Containers[i]
@@ -554,6 +543,7 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 	// re-IP each CNI NIC in place. rewrite Name/Device to the guest's CURRENT name for that MAC
 	// so update_interface (which matches by HwAddr) adds the address without renaming.
 	epNames := map[string]string{} // endpoint-name -> guest-name, for route device remap below
+	reIPd := 0
 	for _, ifc := range ifaces {
 		guestName, ok := macToGuestName[strings.ToUpper(ifc.HwAddr)]
 		if !ok {
@@ -564,8 +554,13 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 		ifc.Name = guestName
 		ifc.Device = guestName
 		if _, uerr := s.agent.updateInterface(ctx, ifc); uerr != nil {
-			return fmt.Errorf("updateInterface %s (mac %s): %w", guestName, ifc.HwAddr, uerr)
+			// non-fatal: a re-IP failure must not skip the frozen-NIC neutralize below, which
+			// is what strips the source's identity. warn + continue (mirrors the missing-mac
+			// case above).
+			s.Logger().WithError(uerr).WithField("mac", ifc.HwAddr).Warn("restore: re-IP of CNI NIC failed; continuing to isolation")
+			continue
 		}
+		reIPd++
 	}
 	s.Logger().WithField("restore-net", "interfaces-applied").WithField("count", len(ifaces)).Info("restore: CNI interfaces configured")
 	// perf: guest re-IP of the adopted CNI NICs (the updateInterface RPCs).
@@ -580,12 +575,14 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 	}
 	if len(routes) > 0 {
 		if _, rerr := s.agent.updateRoutes(ctx, routes); rerr != nil {
-			return fmt.Errorf("updateRoutes: %w", rerr)
+			// non-fatal: installing routes must not skip the isolation step below.
+			s.Logger().WithError(rerr).Warn("restore: installing CNI routes failed; continuing to isolation")
+		} else {
+			s.Logger().WithField("restore-net", "routes-applied").WithField("count", len(routes)).Info("restore: CNI routes installed")
 		}
-		s.Logger().WithField("restore-net", "routes-applied").WithField("count", len(routes)).Info("restore: CNI routes installed")
 	}
 
-	// #2 isolation-via-routing: the FROZEN snapshot NIC still holds an on-link route for the
+	// isolation-via-routing: the FROZEN snapshot NIC still holds an on-link route for the
 	// pod subnet (e.g. 10.244.0.0/16 dev eth0) baked into guest RAM -- it competes with the CNI
 	// NIC's route and, because eth0's dead tap can't carry traffic, black-holes the clone. the
 	// agent's update_routes uses NLM_F_REPLACE, so re-asserting the subnet + default routes
@@ -626,8 +623,14 @@ func applyRestoreNetwork(ctx context.Context, s *Sandbox) error {
 	// clone's RAM). any guest iface whose MAC is NOT owned by an adopted CNI endpoint is the
 	// frozen one; the (rebuilt) agent downs it + flushes its addresses so the clone shares no
 	// mac/ip/route with its source. this is what makes TCP + egress work (the frozen NIC's stale
-	// /16 route otherwise black-holes) AND delivers complete isolation.
-	neutralizeFrozenNIC(ctx, s, before, eps)
+	// /16 route otherwise black-holes) AND delivers complete isolation. only once at least one
+	// CNI NIC was re-IP'd -- otherwise downing the frozen NIC would leave the clone with no
+	// working interface at all.
+	if reIPd > 0 {
+		neutralizeFrozenNIC(ctx, s, before, eps)
+	} else {
+		s.Logger().Warn("restore: no CNI NIC was re-IP'd; skipping frozen-NIC neutralize to avoid a networkless clone")
+	}
 	// perf: down + flush the frozen snapshot NIC (clone isolation).
 	nt.phase("neutralizeNIC")
 
@@ -690,77 +693,6 @@ func neutralizeFrozenNIC(ctx context.Context, s *Sandbox, before []*pbTypes.Inte
 	}
 }
 
-// setupRestoreNetwork is the best-effort host-tap + agent re-IP for a restored clone.
-func setupRestoreNetwork(ctx context.Context, s *Sandbox, snapshotDir, guestIPCIDR string) error {
-	net, err := allocateCloneNet()
-	if err != nil {
-		return err
-	}
-	if guestIPCIDR != "" {
-		net.guestIP = guestIPCIDR
-	}
-	if err := setupTap(net); err != nil {
-		return err
-	}
-
-	mac, err := readSnapshotMAC(snapshotDir)
-	if err != nil {
-		return err
-	}
-	addr, mask := splitCIDR(net.guestIP)
-	ifc := &pbTypes.Interface{
-		Device: "eth0",
-		Name:   "eth0",
-		Mtu:    1500,
-		HwAddr: mac,
-		IPAddresses: []*pbTypes.IPAddress{{
-			Family:  pbTypes.IPFamily_v4,
-			Address: addr,
-			Mask:    mask,
-		}},
-	}
-	if _, err := s.agent.updateInterface(ctx, ifc); err != nil {
-		return fmt.Errorf("agent updateInterface: %w", err)
-	}
-	return nil
-}
-
-// readSnapshotMAC pulls .net[0].mac out of the snapshot's config.json. the clone reuses
-// the original MAC; a fresh MAC is deferred until dup-MAC actually bites.
-func readSnapshotMAC(snapshotDir string) (string, error) {
-	raw, err := os.ReadFile(filepath.Join(snapshotDir, "config.json"))
-	if err != nil {
-		return "", err
-	}
-	var cfg struct {
-		Net []struct {
-			Mac string `json:"mac"`
-		} `json:"net"`
-	}
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return "", err
-	}
-	if len(cfg.Net) == 0 || cfg.Net[0].Mac == "" {
-		return "", fmt.Errorf("snapshot config.json: .net[0].mac missing")
-	}
-	return cfg.Net[0].Mac, nil
-}
-
-// ---- networking helpers (best-effort, copied from cmd/kata-runtime/restore.go --
-// different package, so not importable). ----
-
-const (
-	tapPrefix     = "kat"
-	tapSubnetBase = 240 // 192.168.240.x for clone 0, .241 for clone 1, ...
-	maxClones     = 15
-)
-
-type cloneNet struct {
-	tap     string
-	hostIP  string // CIDR
-	guestIP string // CIDR
-}
-
 // genCloneID returns name if given, else a random clone-<hex> id.
 func genCloneID(name string) string {
 	if name != "" {
@@ -786,52 +718,3 @@ func validateSandboxID(id string) error {
 	return nil
 }
 
-// allocateCloneNet atomically claims a free tap slot (ip tuntap add fails if the device
-// exists) and derives its point-to-point subnet.
-func allocateCloneNet() (cloneNet, error) {
-	for n := 0; n < maxClones; n++ {
-		tap := fmt.Sprintf("%s%d", tapPrefix, n)
-		if err := runIP("tuntap", "add", "mode", "tap", tap); err != nil {
-			continue
-		}
-		octet := tapSubnetBase + n
-		return cloneNet{
-			tap:     tap,
-			hostIP:  fmt.Sprintf("192.168.%d.2/24", octet),
-			guestIP: fmt.Sprintf("192.168.%d.1/24", octet),
-		}, nil
-	}
-	return cloneNet{}, fmt.Errorf("no free clone tap slot (all %d in use)", maxClones)
-}
-
-// setupTap brings an allocated tap up and assigns the host IP + a /32 route to the guest.
-func setupTap(net cloneNet) error {
-	guestAddr, _ := splitCIDR(net.guestIP)
-	for _, args := range [][]string{
-		{"link", "set", "dev", net.tap, "up"},
-		{"a", "add", net.hostIP, "dev", net.tap},
-		{"route", "add", guestAddr + "/32", "dev", net.tap},
-	} {
-		if err := runIP(args...); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// splitCIDR splits "192.168.240.1/24" into ("192.168.240.1", "24").
-func splitCIDR(cidr string) (addr, mask string) {
-	if i := strings.IndexByte(cidr, '/'); i >= 0 {
-		return cidr[:i], cidr[i+1:]
-	}
-	return cidr, ""
-}
-
-// runIP shells out to `ip` (matches the exec.Command("ip",...) precedent in
-// network_linux.go).
-func runIP(args ...string) error {
-	if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("ip %s: %s (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}

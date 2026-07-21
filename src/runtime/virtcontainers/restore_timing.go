@@ -81,7 +81,7 @@ func (t *phaseTimer) phase(name string) {
 }
 
 // summary emits one warn-level line with every phase and the group total, e.g.
-//   RESTORE_PHASES id=<id> total=132.571 config=1.246 shell=44.701 ...
+//   RESTORE_PHASES id=<id> total=132.571 config=1.246 netnsAdopt=35.1 vmboot=73.3 ...
 func (t *phaseTimer) summary() {
 	if t == nil {
 		return

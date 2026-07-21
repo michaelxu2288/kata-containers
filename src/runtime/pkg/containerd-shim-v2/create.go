@@ -265,7 +265,7 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		removeCDIAnnotations(ociSpec.Annotations)
 
 		if s.restoredSandbox {
-			// T5: on a restored sandbox the app container is ALREADY LIVE in the guest (it came
+			// on a restored sandbox the app container is ALREADY LIVE in the guest (it came
 			// back with the snapshot). kubelet still issues CreateContainer per-container, but we
 			// must ADOPT the guest-live container (host-side bookkeeping only), NOT re-create it
 			// in the guest -- a fresh guest create would collide with the running process and trip
