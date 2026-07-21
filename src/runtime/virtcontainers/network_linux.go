@@ -730,9 +730,7 @@ func xConnectVMNetwork(ctx context.Context, endpoint Endpoint, h Hypervisor, res
 		err = tapNetworkPair(ctx, endpoint, queues, disableVhostNet)
 	case NetXConnectTCFilterModel:
 		if restoreFence {
-			// net_fds restore: prepare the tap DOWN with no redirects (the fence). The redirects
-			// are installed later by FinalizeRestoreNetwork after guest identity verification.
-			networkLogger().Info("connect TCFilter to VM network (restore fence: prepare only)")
+			networkLogger().Debug("prepare restore TCFilter")
 			err = prepareRestoreTCFence(ctx, endpoint, queues, disableVhostNet)
 		} else {
 			networkLogger().Info("connect TCFilter to VM network")
@@ -944,24 +942,7 @@ func tapNetworkPair(ctx context.Context, endpoint Endpoint, queues int, disableV
 	return nil
 }
 
-// ---- restore network fence (WP2) ---------------------------------------------------------------
-//
-// The net_fds restore path must NOT forward traffic while the guest still carries the source
-// MAC/IP/routes. But the VM has to resume so kata-agent can reconcile the guest identity, so a
-// paused-VM gate is not enough. The fence therefore splits the normal setupTCFiltering into three
-// operations:
-//   - prepareRestoreTCFence:  create the tap + FDs and set its MAC/MTU, but leave the tap DOWN and
-//     install NO qdiscs/redirects. No frame can cross veth<->tap in either direction.
-//   - activateRestoreTCFence: install both ingress qdiscs and both redirect filters while the tap
-//     is still down, then bring the tap UP as the final exposure step. Called only AFTER the guest
-//     identity has been read back and verified.
-//   - cleanupRestoreTCFence:  idempotently remove the Kata-created redirects/qdiscs/tap. Safe on
-//     partial state and on the adopted-CNI (NetworkCreated=false) case where Detach early-returns.
-//
-// Normal (non-restore) setupTCFiltering is unchanged.
-
-// prepareRestoreTCFence creates the tap for the endpoint with its FDs and target MAC/MTU but leaves
-// it administratively DOWN with no qdiscs or redirect filters, so no traffic can be forwarded yet.
+// prepareRestoreTCFence creates an active TAP without exposing it through TC redirects.
 func prepareRestoreTCFence(ctx context.Context, endpoint Endpoint, queues int, disableVhostNet bool) error {
 	span, _ := networkTrace(ctx, "prepareRestoreTCFence", endpoint)
 	defer span.End()
@@ -993,61 +974,21 @@ func prepareRestoreTCFence(ctx context.Context, endpoint Endpoint, queues int, d
 		return err
 	}
 	attrs := link.Attrs()
-	// TAP carries the veth MAC (the guest-side identity) so redirected frames are accepted later.
 	netPair.TAPIface.HardAddr = attrs.HardwareAddr.String()
 
 	if err := netHandle.LinkSetMTU(tapLink, attrs.MTU); err != nil {
 		return fmt.Errorf("restore fence: could not set TAP MTU %d: %s", attrs.MTU, err)
 	}
 
-	// The tap is brought UP so CLH has a valid live FD for its virtio-net device (a DOWN tap stalls
-	// the guest NIC and can fault CLH). The FENCE is the ABSENCE of the two tc mirred redirect
-	// filters between the CNI veth and the tap: with no redirect path installed, no frame crosses
-	// veth<->tap in either direction even though the tap is up. The redirects are installed later by
-	// activateRestoreTCFence, only after the guest identity is verified.
+	// CLH requires a live TAP; absent redirects keep traffic fenced.
 	if err := netHandle.LinkSetUp(tapLink); err != nil {
 		return fmt.Errorf("restore fence: could not bring TAP up: %s", err)
 	}
-	networkLogger().WithField("tap", netPair.TAPIface.Name).Info("restore fence: prepared TAP up, no redirects (fence = no redirect path)")
+	networkLogger().WithField("tap", netPair.TAPIface.Name).Debug("restore network fence prepared")
 	return nil
 }
 
-// restoreTCFenceIsClosed reports whether the fence is closed: NEITHER the tap NOR the CNI veth
-// carries an ingress redirect filter. The tap is up (CLH needs a live FD); the gate is the absence
-// of the redirect path, not the tap being down.
-func restoreTCFenceIsClosed(ctx context.Context, endpoint Endpoint) (bool, error) {
-	netHandle, err := netlink.NewHandle()
-	if err != nil {
-		return false, err
-	}
-	defer netHandle.Close()
-	netPair := endpoint.NetworkPair()
-
-	tapLink, err := netHandle.LinkByName(netPair.TAPIface.Name)
-	if err != nil {
-		return false, err
-	}
-	veth, err := getLinkForEndpoint(endpoint, netHandle)
-	if err != nil {
-		return false, err
-	}
-	for _, l := range []netlink.Link{tapLink, veth} {
-		filters, ferr := netHandle.FilterList(l, netlink.MakeHandle(0xffff, 0))
-		if ferr != nil {
-			// cannot enumerate filters -> we cannot assert the fence is closed; propagate rather
-			// than falsely reporting "closed" (which could green-light exposure).
-			return false, fmt.Errorf("restore fence: list ingress filters on %s: %w", l.Attrs().Name, ferr)
-		}
-		if len(filters) > 0 {
-			return false, nil // a redirect filter exists
-		}
-	}
-	return true, nil
-}
-
-// activateRestoreTCFence installs both ingress qdiscs and both redirect filters (veth<->tap) while
-// the tap is down, then brings the tap UP as the final exposure step. On any partial failure it
-// rolls back to the closed (tap-down, no-redirect) state. Call only after identity verification.
+// activateRestoreTCFence exposes the TAP after guest identity verification.
 func activateRestoreTCFence(ctx context.Context, endpoint Endpoint) (err error) {
 	span, _ := networkTrace(ctx, "activateRestoreTCFence", endpoint)
 	defer span.End()
@@ -1070,13 +1011,11 @@ func activateRestoreTCFence(ctx context.Context, endpoint Endpoint) (err error) 
 	tapIdx := tapLink.Attrs().Index
 	vethIdx := veth.Attrs().Index
 
-	// rollback to the CLOSED fence state (no redirect path) on any failure during activation: remove
-	// the qdiscs/redirects. The tap stays UP (CLH needs its live FD) -- the gate is redirect absence,
-	// not tap-down. Do NOT LinkDel the tap here; full teardown belongs to the abort path.
+	// Remove partial redirect state on failure.
 	defer func() {
 		if err != nil {
-			_ = removeIngressQdiscByIndex(tapIdx)
-			_ = removeIngressQdiscByIndex(vethIdx)
+			_ = removeQdiscIngress(tapLink)
+			_ = removeQdiscIngress(veth)
 		}
 	}()
 
@@ -1092,17 +1031,12 @@ func activateRestoreTCFence(ctx context.Context, endpoint Endpoint) (err error) 
 	if err = addRedirectTCFilter(tapIdx, vethIdx); err != nil {
 		return err
 	}
-	// final exposure step: bring the tap up now that both redirect directions are installed.
-	// the tap is already up (from prepareRestoreTCFence); installing both redirect filters is the
-	// final exposure step -- traffic can now cross veth<->tap.
-	networkLogger().WithField("tap", netPair.TAPIface.Name).Info("restore fence: activated redirects (traffic now flows)")
+	networkLogger().WithField("tap", netPair.TAPIface.Name).Debug("restore network fence activated")
 	return nil
 }
 
-// cleanupRestoreTCFence idempotently removes Kata-created restore network state: both redirect
-// filters, both ingress qdiscs, and the tap link. It never touches the CNI-owned veth/netns. Safe
-// to call on partial state and when the endpoint's normal Detach early-returns (NetworkCreated=false).
-func cleanupRestoreTCFence(ctx context.Context, endpoint Endpoint) {
+// cleanupRestoreTCFence removes Kata-created restore networking state.
+func cleanupRestoreTCFence(endpoint Endpoint) {
 	netHandle, err := netlink.NewHandle()
 	if err != nil {
 		return
@@ -1111,27 +1045,14 @@ func cleanupRestoreTCFence(ctx context.Context, endpoint Endpoint) {
 	netPair := endpoint.NetworkPair()
 
 	if veth, verr := getLinkForEndpoint(endpoint, netHandle); verr == nil {
-		// remove the ingress qdisc on the veth (this also drops its redirect filter); best-effort.
-		_ = removeIngressQdiscByIndex(veth.Attrs().Index)
+		_ = removeQdiscIngress(veth)
 	}
 	if tapLink, tapErr := netHandle.LinkByName(netPair.TAPIface.Name); tapErr == nil {
-		_ = removeIngressQdiscByIndex(tapLink.Attrs().Index)
+		_ = removeQdiscIngress(tapLink)
 		_ = netHandle.LinkSetDown(tapLink)
 		_ = netHandle.LinkDel(tapLink)
 	}
-	networkLogger().WithField("tap", netPair.TAPIface.Name).Info("restore fence: cleaned up tap/qdisc/filter")
-}
-
-// removeIngressQdiscByIndex removes the ingress qdisc (and thus its redirect filters) from a link
-// index. Best-effort; a missing qdisc returns an error the caller ignores.
-func removeIngressQdiscByIndex(index int) error {
-	qdisc := &netlink.Ingress{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: index,
-			Parent:    netlink.HANDLE_INGRESS,
-		},
-	}
-	return netlink.QdiscDel(qdisc)
+	networkLogger().WithField("tap", netPair.TAPIface.Name).Debug("restore network fence cleaned")
 }
 
 func setupTCFiltering(ctx context.Context, endpoint Endpoint, queues int, disableVhostNet bool) error {

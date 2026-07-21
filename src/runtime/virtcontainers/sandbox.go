@@ -262,10 +262,7 @@ type Sandbox struct {
 	// containers.
 	hotplugNetworkConfigApplied bool
 
-	// restoreNetFence, when true, makes the endpoint attach path prepare the tap DOWN with no TC
-	// redirects (the net_fds restore fence) instead of the normal setupTCFiltering. Set only on the
-	// annotation-restore path before AddEndpoints; the redirects are installed later by
-	// FinalizeRestoreNetwork after guest identity verification.
+	// restoreNetFence delays TC redirects until the restored guest identity is replaced.
 	restoreNetFence bool
 }
 

@@ -28,17 +28,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
 use std::str::{self, FromStr};
 
-// KATA_IFACE_NEUTRALIZE: a raw_flags sentinel (high bit, never a real IFF_* flag) asking the
-// agent to down + flush a link instead of configuring it. Used to disable a restored clone's
-// frozen snapshot NIC so it shares no network identity with its source.
-pub const KATA_IFACE_NEUTRALIZE: u32 = 0x8000_0000;
-
-// KATA_IFACE_RESTORE_REPLACE: a raw_flags sentinel (a distinct high bit) asking the agent to
-// REPLACE the identity of an EXISTING restored NIC. On the net_fds restore path the guest NIC
-// keeps the SOURCE snapshot MAC/IP, so the normal update_interface (which selects the link by the
-// TARGET MAC) finds no match. With this flag the agent selects the link by NAME (iface.name = the
-// guest's current name), flushes its source addresses, sets the TARGET MAC via IFLA_ADDRESS
-// (rtnetlink LinkSetRequest::address), then applies the target addresses/MTU and brings it up.
+// Must match kataIfaceRestoreReplace in virtcontainers/restore.go.
 pub const KATA_IFACE_RESTORE_REPLACE: u32 = 0x4000_0000;
 
 /// Search criteria to use when looking for a link in `find_link`.
@@ -117,11 +107,6 @@ impl Handle {
     }
 
     pub async fn update_interface(&mut self, iface: &Interface) -> Result<()> {
-        // restore-replace path: the net_fds-restored guest NIC still holds the SOURCE snapshot
-        // MAC, so we cannot select it by the target MAC. Select by NAME (the guest's current name),
-        // flush the source addresses, set the TARGET MAC (IFLA_ADDRESS), then apply target
-        // addresses/MTU and bring it up. This is the smallest agent extension proven necessary by
-        // the stage-3 node experiment (updateInterface alone cannot set IFLA_ADDRESS).
         if iface.raw_flags & KATA_IFACE_RESTORE_REPLACE != 0 {
             return self.restore_replace_interface(iface).await;
         }
@@ -133,16 +118,6 @@ impl Handle {
         // we cannot use that to find target link.
         // let's try if hardware address filter works. -_-
         let link = self.find_link(LinkFilter::Address(&iface.hwAddr)).await?;
-
-        // neutralize path: down + flush all addresses and return, instead of configuring.
-        // matched by mac above, so it only ever hits the frozen snapshot NIC, not the CNI NIC.
-        if iface.raw_flags & KATA_IFACE_NEUTRALIZE != 0 {
-            if link.is_up() {
-                self.enable_link(link.index(), false).await?;
-            }
-            self.del_all_addresses(link.index()).await?;
-            return Ok(());
-        }
 
         // Bring down interface if it is UP
         if link.is_up() {
@@ -254,27 +229,17 @@ impl Handle {
         Ok(())
     }
 
-    /// restore_replace_interface installs the target CNI identity onto an EXISTING restored NIC
-    /// whose current identity is the source snapshot's. The link is selected by NAME (the guest's
-    /// current interface name in iface.name), because its current MAC is the SOURCE MAC and does
-    /// not match the target. Sequence: down -> flush source addresses -> set target MAC via
-    /// IFLA_ADDRESS -> add target addresses -> set MTU/name/arp -> up. This is the minimal agent
-    /// extension for the net_fds restore path (the normal update_interface selects by target MAC
-    /// and cannot set IFLA_ADDRESS).
+    /// Replaces a restored interface's source identity with the target identity.
     async fn restore_replace_interface(&mut self, iface: &Interface) -> Result<()> {
-        // select by the guest's CURRENT name (not the target MAC, which is not present yet).
         let link = self.find_link(LinkFilter::Name(iface.name.as_str())).await?;
         let index = link.index();
 
-        // bring the link down before changing its hardware address.
         if link.is_up() {
             self.enable_link(index, false).await?;
         }
 
-        // flush the source snapshot addresses so only the target identity remains.
         self.del_all_addresses(index).await?;
 
-        // set the TARGET MAC (IFLA_ADDRESS). This is the operation the normal path cannot do.
         let mac = parse_mac_address(&iface.hwAddr)
             .map_err(|e| anyhow!("restore-replace: parse target mac {}: {}", iface.hwAddr, e))?;
         {
@@ -287,7 +252,6 @@ impl Handle {
                 .map_err(|e| anyhow!("restore-replace: set IFLA_ADDRESS on {}: {}", iface.name, e))?;
         }
 
-        // detect ipv6 support the same way the normal path does.
         let supports_ipv6_all = fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
             .map(|s| s.trim() == "0")
             .unwrap_or(false);
@@ -297,13 +261,10 @@ impl Handle {
                 .unwrap_or(false);
         let supports_ipv6 = supports_ipv6_default || supports_ipv6_all;
 
-        // add the target addresses.
         for ip_address in &iface.IPAddresses {
             let ip = IpAddr::from_str(ip_address.address())?;
             let mask = ip_address.mask().parse::<u8>()?;
             let net = IpNetwork::new(ip, mask)?;
-            // WP4.7: a target IPv6 address on a stack with IPv6 disabled is FATAL, not silently
-            // dropped -- the restored identity would be incomplete.
             if !net.is_ipv4() && !supports_ipv6 {
                 return Err(anyhow!(
                     "restore-replace: target IPv6 address {} requested but guest IPv6 is disabled",
@@ -313,10 +274,6 @@ impl Handle {
             self.add_addresses(index, std::iter::once(net)).await?;
         }
 
-        // re-fetch the link (index is stable, but refresh the header) and apply name/arp (and mtu
-        // when a positive value was supplied). Setting IFLA_ADDRESS can leave the link down, so we
-        // do NOT rely on a combined .up() here -- we bring it up explicitly below with the proven
-        // enable_link primitive so a route install immediately after does not hit "network is down".
         let link = self.find_link(LinkFilter::Index(index)).await?;
         {
             let mut request = self.handle.link().set(index);
@@ -333,7 +290,6 @@ impl Handle {
                 .map_err(|e| anyhow!("restore-replace: set name/mtu/arp on {}: {}", iface.name, e))?;
         }
 
-        // bring the link UP explicitly (separate request), so the identity is live before routes.
         self.enable_link(index, true).await?;
 
         Ok(())
@@ -625,9 +581,6 @@ impl Handle {
                     request = request.gateway(ip);
                 }
 
-                // Propagate EVERY non-success except the intentionally-handled EEXIST idempotent
-                // case (WP4.6). A NetlinkError with a None code, or any other rtnetlink error
-                // variant, must NOT be silently treated as success.
                 if let Err(e) = request.execute().await {
                     let ignore = matches!(
                         &e,
@@ -675,8 +628,6 @@ impl Handle {
                     request = request.gateway(ip);
                 }
 
-                // Propagate EVERY non-success except the intentionally-handled EEXIST idempotent
-                // case (WP4.6).
                 if let Err(e) = request.execute().await {
                     let ignore = matches!(
                         &e,
@@ -739,7 +690,6 @@ impl Handle {
         Ok(())
     }
 
-    // del_all_addresses removes every address on a link (used by the neutralize path).
     async fn del_all_addresses(&mut self, index: u32) -> Result<()> {
         let addrs = self
             .list_addresses(AddressFilter::LinkIndex(index))

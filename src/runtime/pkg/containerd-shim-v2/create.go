@@ -188,21 +188,15 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		// ctx will be canceled after this rpc service call, but the sandbox will live
 		// across multiple rpc service calls.
 		//
-		// when the restore-from annotation is set, restore the sandbox from that snapshot
-		// instead of a fresh boot. r.ID is the containerd-assigned (fresh) sandbox id.
 		var sandbox vc.VCSandbox
 		var isRestore bool
 		if rf := ociSpec.Annotations[annotations.RestoreFrom]; rf != "" {
-			snapDir, rerr := ResolveRestoreSource(rf, true)
+			snapDir, rerr := resolveRestoreSource(rf)
 			if rerr != nil {
 				return nil, fmt.Errorf("resolve restore-from %q: %w", rf, rerr)
 			}
 			shimLog.WithFields(logrus.Fields{"restore-from": rf, "snapshot-dir": snapDir, "sandbox": r.ID}).Info("dispatching restore-from-snapshot")
-			// source the pod's CNI netns path from the LIVE OCI spec (containerd ran CNI
-			// ADD during RunPodSandbox and wrote it into the network namespace .Path). mirror
-			// oci.networkConfig (pkg/oci/utils.go). vc.RestoreSandbox cannot import pkg/oci
-			// (import cycle), so read it here and pass it in. do NOT use the persisted
-			// NetworkConfig.NetworkID -- that carries the SOURCE sandbox's netns.
+			// Use the target pod's live netns, never the snapshot's source netns.
 			var netNSPath string
 			if ociSpec.Linux != nil {
 				for _, ns := range ociSpec.Linux.Namespaces {
@@ -225,7 +219,6 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		if err != nil {
 			return nil, err
 		}
-		// only mark restored on success -- a failed restore must not leave the flag set.
 		s.restoredSandbox = isRestore
 		s.sandbox = sandbox
 		pid, err := s.sandbox.GetHypervisorPid()
@@ -247,20 +240,13 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		}
 
 		if s.restoredSandbox {
-			// WP3/M1: on a restored sandbox the workload container is ALREADY LIVE in the guest (it
-			// came back with the snapshot). Adoption is HOST-ONLY: branch BEFORE checkAndMount and
-			// before any rootfs/device/guest-create work. A fresh mount+guest create would collide
-			// with the running process and trip guest gates (e.g. Guest-SELinux host/guest
-			// mismatch). Build the same ContainerConfig katautils.CreateContainer would (for host
-			// bookkeeping), but pass the un-mounted rootfs and adopt via RestoreContainer, which
-			// performs no createMounts/createDevices and no guest CreateContainer.
 			removeCDIAnnotations(ociSpec.Annotations)
 			contConfig, cerr := oci.ContainerConfig(*ociSpec, bundlePath, r.ID, disableOutput)
 			if cerr != nil {
 				err = cerr
 				return nil, err
 			}
-			contConfig.RootFs = rootFs // not mounted; adoption skips mount/device setup
+			contConfig.RootFs = rootFs
 			if _, err = s.sandbox.RestoreContainer(ctx, contConfig); err != nil {
 				return nil, err
 			}
