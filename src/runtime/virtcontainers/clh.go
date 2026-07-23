@@ -1814,13 +1814,32 @@ func (clh *cloudHypervisor) terminate(ctx context.Context, waitOnly bool) (err e
 		if clhRunning {
 			ctx, cancel := context.WithTimeout(context.Background(), clh.getClhStopSandboxTimeout()*time.Second)
 			defer cancel()
+			// Cooperative shutdown. This can fail if the guest agent is unresponsive
+			// (common for restored/cloned sandboxes), so a failure here must not abort
+			// termination: fall through to the SIGKILL fallback below, otherwise the VMM
+			// is left running as an orphan and its MAP_PRIVATE memory-ranges mapping leaks
+			// the (deleted) snapshot memory into the small /run tmpfs.
 			if _, err = clh.client().ShutdownVMM(ctx); err != nil {
-				return err
+				clh.Logger().WithError(err).Warn("ShutdownVMM failed; will force-kill the VMM")
 			}
 		}
 	}
 
-	if err = utils.WaitLocalProcess(pid, uint(clh.getClhStopSandboxTimeout()), syscall.Signal(0), clh.Logger()); err != nil {
+	// Wait for the VMM to exit on its own; if it does not (e.g. the cooperative
+	// shutdown above failed), force-kill it. WaitLocalProcess with Signal(0) only
+	// polls liveness - it never kills - so without this fallback a stuck VMM would
+	// wedge the sandbox in Terminating forever and orphan the memory-ranges mapping.
+	if pidRunning && !waitOnly {
+		if werr := utils.WaitLocalProcess(pid, uint(clh.getClhStopSandboxTimeout()), syscall.Signal(0), clh.Logger()); werr != nil {
+			clh.Logger().WithError(werr).Warn("VMM did not exit after cooperative shutdown; sending SIGKILL")
+			if kerr := syscall.Kill(pid, syscall.SIGKILL); kerr != nil && kerr != syscall.ESRCH {
+				clh.Logger().WithError(kerr).Error("failed to SIGKILL the VMM")
+			} else {
+				// Reap so the pid is not left as a zombie holding the mapping.
+				_, _ = syscall.Wait4(pid, nil, 0, nil)
+			}
+		}
+	} else if err = utils.WaitLocalProcess(pid, uint(clh.getClhStopSandboxTimeout()), syscall.Signal(0), clh.Logger()); err != nil {
 		return err
 	}
 
