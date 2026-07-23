@@ -261,6 +261,8 @@ type Sandbox struct {
 	// multiple times for hot-plugged network device when Sandbox has multiple
 	// containers.
 	hotplugNetworkConfigApplied bool
+
+	restoreNetFence bool
 }
 
 // ID returns the sandbox identifier string.
@@ -1059,6 +1061,16 @@ func (s *Sandbox) removeNetwork(ctx context.Context) error {
 	span, ctx := katatrace.Trace(ctx, s.Logger(), "removeNetwork", sandboxTracingTags, map[string]string{"sandbox_id": s.id})
 	defer span.End()
 
+	if s.restoreNetFence {
+		if err := s.network.Run(ctx, func() error {
+			for _, ep := range s.network.Endpoints() {
+				cleanupRestoreTCFence(ep)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	return s.network.RemoveEndpoints(ctx, s, nil, false)
 }
 

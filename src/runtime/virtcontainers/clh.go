@@ -307,7 +307,20 @@ type cloudHypervisor struct {
 	state           CloudHypervisorState
 	config          HypervisorConfig
 	stopped         int32
+	restoreNetFds   []*os.File
+	restoreNetID    string
 	mu              sync.Mutex
+}
+
+type restoredNetConfig struct {
+	Id     string `json:"id"`
+	NumFds int32  `json:"num_fds"`
+	Fds    []int  `json:"fds"`
+}
+
+type restoreConfigWithNetFds struct {
+	SourceUrl string              `json:"source_url"`
+	NetFds    []restoredNetConfig `json:"net_fds"`
 }
 
 var clhKernelParams = []Param{
@@ -796,40 +809,91 @@ func (clh *cloudHypervisor) copyFile(src, dst string) error {
 	return dstFile.Sync()
 }
 
-// updateVsockSocketPath updates the vsock socket path in the config.json file
-func (clh *cloudHypervisor) updateVsockSocketPath(configPath, vmID string) error {
-	// Read the config file
+// preparePrivateRestoreConfig patches only the runtime copy and preserves net_fds markers.
+func (clh *cloudHypervisor) preparePrivateRestoreConfig(configPath, vmID string) error {
 	configData, err := os.ReadFile(configPath)
 	if err != nil {
 		return err
 	}
-
 	var config map[string]interface{}
-	if err := json.Unmarshal(configData, &config); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(configData))
+	dec.UseNumber()
+	if err := dec.Decode(&config); err != nil {
 		return err
 	}
 
-	// Update vsock socket path if vsock exists
 	if vsock, ok := config["vsock"].(map[string]interface{}); ok {
-		// Generate new vsock socket path for this VM
-		newVsockPath, err := clh.vsockSocketPath(vmID)
-		if err != nil {
-			return err
+		newVsockPath, verr := clh.vsockSocketPath(vmID)
+		if verr != nil {
+			return verr
 		}
 		vsock["socket"] = newVsockPath
-
-		clh.Logger().WithFields(log.Fields{
-			"vmID":         vmID,
-			"newVsockPath": newVsockPath,
-		}).Debug("Updated vsock socket path in config.json")
+		clh.Logger().WithFields(log.Fields{"vmID": vmID, "newVsockPath": newVsockPath}).
+			Debug("restore: set unique vsock socket path in private config")
 	}
 
-	// Write the updated config back to file
+	memorySection, ok := config["memory"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid snapshot config: memory section missing")
+	}
+	memorySection["shared"] = false
+	if zones, ok := memorySection["zones"].([]interface{}); ok {
+		for _, zone := range zones {
+			if zoneMap, ok := zone.(map[string]interface{}); ok {
+				zoneMap["shared"] = false
+			}
+		}
+	}
+
+	nets, _ := config["net"].([]interface{})
+	if len(clh.restoreNetFds) > 0 {
+		if len(nets) != 1 {
+			return fmt.Errorf("kata restore failed: expected exactly one saved net device, found %d", len(nets))
+		}
+		nm, ok := nets[0].(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("kata restore failed: saved net[0] is not an object")
+		}
+		id, _ := nm["id"].(string)
+		if id == "" {
+			return fmt.Errorf("kata restore failed: saved net[0] has empty id")
+		}
+		clh.restoreNetID = id
+		if t, present := nm["tap"]; present && t != nil {
+			return fmt.Errorf("kata restore failed: saved net[0].tap must be null for net_fds restore, got %v", t)
+		}
+		savedFds, ok := nm["fds"].([]interface{})
+		if !ok || len(savedFds) == 0 {
+			return fmt.Errorf("kata restore failed: saved net[0].fds marker is null/empty; cannot net_fds-restore")
+		}
+		if len(savedFds) != len(clh.restoreNetFds) {
+			return fmt.Errorf("kata restore failed: saved fds marker length %d != staged tap FD count %d", len(savedFds), len(clh.restoreNetFds))
+		}
+		if nq, ok := nm["num_queues"]; ok {
+			nqNumber, ok := nq.(json.Number)
+			if !ok {
+				return fmt.Errorf("kata restore failed: saved net[0].num_queues is not a number: %T", nq)
+			}
+			nqi, perr := nqNumber.Int64()
+			if perr != nil {
+				return fmt.Errorf("kata restore failed: saved net[0].num_queues is not an integer: %w", perr)
+			}
+			if nqi != int64(2*len(savedFds)) {
+				return fmt.Errorf("kata restore failed: saved net[0].num_queues %d != 2*fds %d", nqi, 2*len(savedFds))
+			}
+		}
+	} else {
+		for _, n := range nets {
+			if nm, ok := n.(map[string]interface{}); ok {
+				nm["fds"] = nil
+			}
+		}
+	}
+
 	updatedConfig, err := json.Marshal(config)
 	if err != nil {
 		return err
 	}
-
 	return os.WriteFile(configPath, updatedConfig, 0644)
 }
 
@@ -879,6 +943,16 @@ func (clh *cloudHypervisor) RestoreVM(ctx context.Context, snapshotDir string) e
 	defer span.End()
 
 	clh.Logger().WithField("function", "RestoreVM").Info("restoring Sandbox")
+
+	defer func() {
+		for _, f := range clh.restoreNetFds {
+			if f != nil {
+				_ = f.Close()
+			}
+		}
+		clh.restoreNetFds = nil
+		clh.restoreNetID = ""
+	}()
 
 	if err := clh.launchAndInit(ctx); err != nil {
 		return err
@@ -971,10 +1045,18 @@ func (clh *cloudHypervisor) prepareRestoreFiles(snapshotDir string) error {
 		return fmt.Errorf("failed to copy state.json: %v", err)
 	}
 
-	// Update vsock socket path in the copied config.json so the restored VM
-	// uses a unique, per-VM socket instead of the snapshot's original one.
-	if err := clh.updateVsockSocketPath(dstConfig, clh.id); err != nil {
-		return fmt.Errorf("failed to update vsock socket path: %v", err)
+	// MAP_PRIVATE keeps the symlinked source memory copy-on-write.
+	srcMem := filepath.Join(snapshotDir, "memory-ranges")
+	if _, err := os.Stat(srcMem); err == nil {
+		dstMem := filepath.Join(vmPath, "memory-ranges")
+		_ = os.Remove(dstMem)
+		if err := os.Symlink(srcMem, dstMem); err != nil {
+			return fmt.Errorf("failed to symlink memory-ranges: %v", err)
+		}
+	}
+
+	if err := clh.preparePrivateRestoreConfig(dstConfig, clh.id); err != nil {
+		return fmt.Errorf("failed to prepare private restore config: %v", err)
 	}
 
 	return nil
@@ -1732,13 +1814,32 @@ func (clh *cloudHypervisor) terminate(ctx context.Context, waitOnly bool) (err e
 		if clhRunning {
 			ctx, cancel := context.WithTimeout(context.Background(), clh.getClhStopSandboxTimeout()*time.Second)
 			defer cancel()
+			// Cooperative shutdown. This can fail if the guest agent is unresponsive
+			// (common for restored/cloned sandboxes), so a failure here must not abort
+			// termination: fall through to the SIGKILL fallback below, otherwise the VMM
+			// is left running as an orphan and its MAP_PRIVATE memory-ranges mapping leaks
+			// the (deleted) snapshot memory into the small /run tmpfs.
 			if _, err = clh.client().ShutdownVMM(ctx); err != nil {
-				return err
+				clh.Logger().WithError(err).Warn("ShutdownVMM failed; will force-kill the VMM")
 			}
 		}
 	}
 
-	if err = utils.WaitLocalProcess(pid, uint(clh.getClhStopSandboxTimeout()), syscall.Signal(0), clh.Logger()); err != nil {
+	// Wait for the VMM to exit on its own; if it does not (e.g. the cooperative
+	// shutdown above failed), force-kill it. WaitLocalProcess with Signal(0) only
+	// polls liveness - it never kills - so without this fallback a stuck VMM would
+	// wedge the sandbox in Terminating forever and orphan the memory-ranges mapping.
+	if pidRunning && !waitOnly {
+		if werr := utils.WaitLocalProcess(pid, uint(clh.getClhStopSandboxTimeout()), syscall.Signal(0), clh.Logger()); werr != nil {
+			clh.Logger().WithError(werr).Warn("VMM did not exit after cooperative shutdown; sending SIGKILL")
+			if kerr := syscall.Kill(pid, syscall.SIGKILL); kerr != nil && kerr != syscall.ESRCH {
+				clh.Logger().WithError(kerr).Error("failed to SIGKILL the VMM")
+			} else {
+				// Reap so the pid is not left as a zombie holding the mapping.
+				_, _ = syscall.Wait4(pid, nil, 0, nil)
+			}
+		}
+	} else if err = utils.WaitLocalProcess(pid, uint(clh.getClhStopSandboxTimeout()), syscall.Signal(0), clh.Logger()); err != nil {
 		return err
 	}
 
@@ -2060,17 +2161,28 @@ func (clh *cloudHypervisor) restoreVM(ctx context.Context) error {
 	}
 
 	// Prepare restore configuration
-	restoreConfig := *chclient.NewRestoreConfig(sourceURL)
-
 	clh.Logger().WithField("sourceURL", sourceURL).Debug("Restore configuration")
 
-	// Restore VM from template
-	ctxWithTimeout, cancelRestore := context.WithTimeout(ctx, clhRestoreTimeout*time.Second)
-	defer cancelRestore()
-	_, err := cl.VmRestorePut(ctxWithTimeout, restoreConfig)
-	if err != nil {
-		clh.Logger().WithError(err).Error("Failed to restore VM from template")
-		return openAPIClientError(err)
+	// Preserve the caller's deadline; add a fallback only when it has none.
+	ctxWithTimeout := ctx
+	var cancelRestore context.CancelFunc
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		ctxWithTimeout, cancelRestore = context.WithTimeout(ctx, clhRestoreTimeout*time.Second)
+		defer cancelRestore()
+	}
+
+	if len(clh.restoreNetFds) > 0 {
+		// The generated client cannot send SCM_RIGHTS.
+		if err := clh.vmRestorePutWithNetFds(ctxWithTimeout, sourceURL); err != nil {
+			clh.Logger().WithError(err).Error("Failed to restore VM with net_fds")
+			return err
+		}
+	} else {
+		restoreConfig := *chclient.NewRestoreConfig(sourceURL)
+		if _, err := cl.VmRestorePut(ctxWithTimeout, restoreConfig); err != nil {
+			clh.Logger().WithError(err).Error("Failed to restore VM from template")
+			return openAPIClientError(err)
+		}
 	}
 
 	// Check VM state after restoration
@@ -2082,10 +2194,93 @@ func (clh *cloudHypervisor) restoreVM(ctx context.Context) error {
 	clh.Logger().Debugf("VM state after restore: %#v", info)
 
 	if info.State != clhStatePaused {
-		clh.Logger().Warnf("VM state is '%s' after restore, expected 'Paused'", info.State)
+		return fmt.Errorf("kata restore failed: CLH state is %q after restore, expected %q", info.State, clhStatePaused)
 	}
 
 	clh.Logger().Info("Successfully restored VM from template")
+	return nil
+}
+
+// vmRestorePutWithNetFds sends the restore request and TAP FDs over the CLH Unix socket.
+func (clh *cloudHypervisor) vmRestorePutWithNetFds(ctx context.Context, sourceURL string) error {
+	netID := clh.restoreNetID
+	if netID == "" {
+		return fmt.Errorf("kata restore failed: saved net device has no id")
+	}
+	n := len(clh.restoreNetFds)
+
+	placeholder := make([]int, n)
+	for i := range placeholder {
+		placeholder[i] = -1
+	}
+	body := restoreConfigWithNetFds{
+		SourceUrl: sourceURL,
+		NetFds: []restoredNetConfig{{
+			Id:     netID,
+			NumFds: int32(n),
+			Fds:    placeholder,
+		}},
+	}
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal restore net_fds body: %w", err)
+	}
+
+	var dialer net.Dialer
+	genConn, err := dialer.DialContext(ctx, "unix", clh.state.apiSocket)
+	if err != nil {
+		return fmt.Errorf("kata restore failed: dial CLH api socket: %w", err)
+	}
+	conn, ok := genConn.(*net.UnixConn)
+	if !ok {
+		genConn.Close()
+		return fmt.Errorf("kata restore failed: CLH api socket is not a unix conn")
+	}
+	defer conn.Close()
+
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
+
+	req, err := http.NewRequest(http.MethodPut, "http://localhost/api/v1/vm.restore", bytes.NewBuffer(bodyJSON))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Length", strconv.Itoa(len(bodyJSON)))
+
+	payload, err := httputil.DumpRequest(req, true)
+	if err != nil {
+		return err
+	}
+
+	var fds []int
+	for _, f := range clh.restoreNetFds {
+		fds = append(fds, int(f.Fd()))
+	}
+	oob := syscall.UnixRights(fds...)
+	clh.Logger().WithField("net-id", netID).WithField("num-fds", n).Debug("sending restore net_fds")
+	payloadn, oobn, err := conn.WriteMsgUnix(payload, oob, nil)
+	if err != nil {
+		return fmt.Errorf("kata restore failed: write vm.restore request: %w", err)
+	}
+	if payloadn != len(payload) || oobn != len(oob) {
+		return fmt.Errorf("short write to CLH vm.restore: payload %d/%d, oob %d/%d", payloadn, len(payload), oobn, len(oob))
+	}
+
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, req)
+	if err != nil {
+		return fmt.Errorf("kata restore failed: read vm.restore response: %w", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 && resp.StatusCode != 204 {
+		return fmt.Errorf("CLH vm.restore with net_fds failed: status %d, body %q", resp.StatusCode, string(respBody))
+	}
 	return nil
 }
 
@@ -2143,6 +2338,45 @@ func (clh *cloudHypervisor) getDiskRateLimiterConfig() *chclient.RateLimiterConf
 		int64(utils.RevertBytes(uint64(clh.config.DiskRateLimiterBwOneTimeBurst/8))),
 		clh.config.DiskRateLimiterOpsMaxRate,
 		clh.config.DiskRateLimiterOpsOneTimeBurst)
+}
+
+// stageRestoreNet duplicates target TAP FDs for the one-shot CLH restore request.
+func (clh *cloudHypervisor) stageRestoreNet(endpoints []Endpoint) error {
+	if len(endpoints) != 1 {
+		return fmt.Errorf("kata restore failed: expected exactly one restore endpoint, found %d", len(endpoints))
+	}
+	netPair := endpoints[0].NetworkPair()
+	if netPair == nil {
+		return fmt.Errorf("kata restore failed: restore endpoint has a nil network pair")
+	}
+	if len(netPair.TapInterface.VMFds) == 0 {
+		return fmt.Errorf("kata restore failed: restore endpoint has no tap FDs to back the NIC")
+	}
+
+	var dups []*os.File
+	for i, f := range netPair.TapInterface.VMFds {
+		if f == nil {
+			for _, d := range dups {
+				d.Close()
+			}
+			return fmt.Errorf("kata restore failed: tap FD %d is nil", i)
+		}
+		nfd, err := syscall.Dup(int(f.Fd()))
+		if err != nil {
+			for _, d := range dups {
+				d.Close()
+			}
+			return fmt.Errorf("kata restore failed: dup tap FD %d for restore: %w", i, err)
+		}
+		dups = append(dups, os.NewFile(uintptr(nfd), fmt.Sprintf("restore-tap-%d", i)))
+	}
+	for _, f := range netPair.TapInterface.VMFds {
+		_ = f.Close()
+	}
+	netPair.TapInterface.VMFds = nil
+	clh.restoreNetFds = dups
+	clh.Logger().WithField("num-fds", len(dups)).Debug("staged restore TAP FDs")
+	return nil
 }
 
 func (clh *cloudHypervisor) addNet(e Endpoint) error {

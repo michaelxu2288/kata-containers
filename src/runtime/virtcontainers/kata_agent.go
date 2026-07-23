@@ -579,7 +579,7 @@ func (k *kataAgent) exec(ctx context.Context, sandbox *Sandbox, c Container, cmd
 	}
 
 	req := &grpc.ExecProcessRequest{
-		ContainerId: c.id,
+		ContainerId: c.agentID(),
 		ExecId:      uuid.Generate().String(),
 		Process:     kataProcess,
 	}
@@ -1970,7 +1970,7 @@ func (k *kataAgent) startContainer(ctx context.Context, sandbox *Sandbox, c *Con
 	defer span.End()
 
 	req := &grpc.StartContainerRequest{
-		ContainerId: c.id,
+		ContainerId: c.agentID(),
 	}
 
 	_, err := k.sendReq(ctx, req)
@@ -1984,7 +1984,7 @@ func (k *kataAgent) stopContainer(ctx context.Context, sandbox *Sandbox, c Conta
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "stopContainer", kataAgentTracingTags)
 	defer span.End()
 
-	_, err := k.sendReq(ctx, &grpc.RemoveContainerRequest{ContainerId: c.id})
+	_, err := k.sendReq(ctx, &grpc.RemoveContainerRequest{ContainerId: c.agentID()})
 	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
 		return status.Errorf(codes.DeadlineExceeded, "RemoveContainerRequest timed out")
 	}
@@ -1998,8 +1998,8 @@ func (k *kataAgent) signalProcess(ctx context.Context, c *Container, processID s
 		execID = ""
 	}
 	req := &grpc.SignalProcessRequest{
-		ContainerId: c.id,
-		ExecId:      execID,
+		ContainerId: c.agentID(),
+		ExecId:      c.guestExecID(execID),
 		Signal:      uint32(signal),
 	}
 
@@ -2012,8 +2012,8 @@ func (k *kataAgent) signalProcess(ctx context.Context, c *Container, processID s
 
 func (k *kataAgent) winsizeProcess(ctx context.Context, c *Container, processID string, height, width uint32) error {
 	req := &grpc.TtyWinResizeRequest{
-		ContainerId: c.id,
-		ExecId:      processID,
+		ContainerId: c.agentID(),
+		ExecId:      c.guestExecID(processID),
 		Row:         height,
 		Column:      width,
 	}
@@ -2032,7 +2032,7 @@ func (k *kataAgent) updateContainer(ctx context.Context, sandbox *Sandbox, c Con
 	}
 
 	req := &grpc.UpdateContainerRequest{
-		ContainerId: c.id,
+		ContainerId: c.agentID(),
 		Resources:   grpcResources,
 	}
 
@@ -2045,7 +2045,7 @@ func (k *kataAgent) updateContainer(ctx context.Context, sandbox *Sandbox, c Con
 
 func (k *kataAgent) pauseContainer(ctx context.Context, sandbox *Sandbox, c Container) error {
 	req := &grpc.PauseContainerRequest{
-		ContainerId: c.id,
+		ContainerId: c.agentID(),
 	}
 
 	_, err := k.sendReq(ctx, req)
@@ -2057,7 +2057,7 @@ func (k *kataAgent) pauseContainer(ctx context.Context, sandbox *Sandbox, c Cont
 
 func (k *kataAgent) resumeContainer(ctx context.Context, sandbox *Sandbox, c Container) error {
 	req := &grpc.ResumeContainerRequest{
-		ContainerId: c.id,
+		ContainerId: c.agentID(),
 	}
 
 	_, err := k.sendReq(ctx, req)
@@ -2110,7 +2110,7 @@ func (k *kataAgent) onlineCPUMem(ctx context.Context, cpus uint32, cpuOnly bool)
 
 func (k *kataAgent) statsContainer(ctx context.Context, sandbox *Sandbox, c Container) (*ContainerStats, error) {
 	req := &grpc.StatsContainerRequest{
-		ContainerId: c.id,
+		ContainerId: c.agentID(),
 	}
 
 	returnStats, err := k.sendReq(ctx, req)
@@ -2213,8 +2213,8 @@ func (k *kataAgent) waitProcess(ctx context.Context, c *Container, processID str
 	defer span.End()
 
 	resp, err := k.sendReq(ctx, &grpc.WaitProcessRequest{
-		ContainerId: c.id,
-		ExecId:      processID,
+		ContainerId: c.agentID(),
+		ExecId:      c.guestExecID(processID),
 	})
 	if err != nil {
 		if err.Error() == context.DeadlineExceeded.Error() {
@@ -2228,8 +2228,8 @@ func (k *kataAgent) waitProcess(ctx context.Context, c *Container, processID str
 
 func (k *kataAgent) writeProcessStdin(ctx context.Context, c *Container, ProcessID string, data []byte) (int, error) {
 	resp, err := k.sendReq(ctx, &grpc.WriteStreamRequest{
-		ContainerId: c.id,
-		ExecId:      ProcessID,
+		ContainerId: c.agentID(),
+		ExecId:      c.guestExecID(ProcessID),
 		Data:        data,
 	})
 
@@ -2245,8 +2245,8 @@ func (k *kataAgent) writeProcessStdin(ctx context.Context, c *Container, Process
 
 func (k *kataAgent) closeProcessStdin(ctx context.Context, c *Container, ProcessID string) error {
 	_, err := k.sendReq(ctx, &grpc.CloseStdinRequest{
-		ContainerId: c.id,
-		ExecId:      ProcessID,
+		ContainerId: c.agentID(),
+		ExecId:      c.guestExecID(ProcessID),
 	})
 	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
 		return status.Errorf(codes.DeadlineExceeded, "CloseStdinRequest timed out")
@@ -2464,7 +2464,7 @@ func (k *kataAgent) readProcessStdout(ctx context.Context, c *Container, process
 		defer k.disconnect(ctx)
 	}
 
-	return k.readProcessStream(c.id, processID, data, k.client.AgentServiceClient.ReadStdout)
+	return k.readProcessStream(c.agentID(), c.guestExecID(processID), data, k.client.AgentServiceClient.ReadStdout)
 }
 
 // readStdout and readStderr are special that we cannot differentiate them with the request types...
@@ -2476,7 +2476,7 @@ func (k *kataAgent) readProcessStderr(ctx context.Context, c *Container, process
 		defer k.disconnect(ctx)
 	}
 
-	return k.readProcessStream(c.id, processID, data, k.client.AgentServiceClient.ReadStderr)
+	return k.readProcessStream(c.agentID(), c.guestExecID(processID), data, k.client.AgentServiceClient.ReadStderr)
 }
 
 type readFn func(context.Context, *grpc.ReadStreamRequest) (*grpc.ReadStreamResponse, error)
