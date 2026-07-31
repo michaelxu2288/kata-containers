@@ -508,15 +508,27 @@ func packageErofsSnapshotDisks(destDir string, cfg map[string]interface{}) (bool
 		if !ok || sourcePath == "" {
 			continue
 		}
+		// Match disks by role suffix, not exact basename: a restored clone's
+		// disks are already renamed ("5-layer.erofs" packaged read-only layers,
+		// "3-3-rwlayer.img" private writable copies), and an exact match would
+		// silently skip them, leaving a second-generation snapshot dependent on
+		// the first snapshot's files and the clone's ephemeral VM directory.
 		baseName := filepath.Base(sourcePath)
-		if baseName != "layer.erofs" && baseName != "rwlayer.img" {
+		var role string
+		switch {
+		case strings.HasSuffix(baseName, "layer.erofs"):
+			role = "layer.erofs"
+		case strings.HasSuffix(baseName, "rwlayer.img"):
+			role = "rwlayer.img"
+		default:
 			continue
 		}
 
 		if err := os.MkdirAll(diskDir, 0700); err != nil {
 			return false, fmt.Errorf("create snapshot disk directory: %w", err)
 		}
-		destinationPath := filepath.Join(diskDir, fmt.Sprintf("%d-%s", index, baseName))
+		// normalized name keeps packaged disks stable across generations
+		destinationPath := filepath.Join(diskDir, fmt.Sprintf("%d-%s", index, role))
 		if filepath.Clean(sourcePath) != filepath.Clean(destinationPath) {
 			if err := copySnapshotFile(sourcePath, destinationPath); err != nil {
 				return false, fmt.Errorf("package snapshot disk %q from %s: %w", disk["id"], sourcePath, err)
