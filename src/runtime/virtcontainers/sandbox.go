@@ -277,6 +277,53 @@ type Sandbox struct {
 
 	restoreNetFence bool
 	restoreActivated bool
+
+	// guestQuiesce tracks intentional guest pauses (snapshot, container pause).
+	// While the guest is deliberately not running it cannot answer the liveness
+	// monitor, and that silence must not be mistaken for a dead sandbox.
+	quiesceMu    sync.Mutex
+	quiesceDepth int
+	quiesceStart time.Time
+}
+
+// maxGuestQuiesce bounds how long an intentional pause may suppress liveness
+// checks. A resume that never lands must not mute the monitor forever.
+const maxGuestQuiesce = 15 * time.Minute
+
+// beginGuestQuiesce records that the guest is being paused on purpose.
+func (s *Sandbox) beginGuestQuiesce() {
+	s.quiesceMu.Lock()
+	defer s.quiesceMu.Unlock()
+	// Always restamp. A resume that fails leaves the depth raised, and keying
+	// the timestamp off a 0 -> 1 transition would make every later pause on this
+	// sandbox inherit the stale start time and count as already expired.
+	s.quiesceStart = time.Now()
+	s.quiesceDepth++
+}
+
+// endGuestQuiesce records that an intentional pause has been lifted.
+func (s *Sandbox) endGuestQuiesce() {
+	s.quiesceMu.Lock()
+	defer s.quiesceMu.Unlock()
+	if s.quiesceDepth > 0 {
+		s.quiesceDepth--
+	}
+}
+
+// guestQuiesced reports whether the guest is intentionally paused right now.
+func (s *Sandbox) guestQuiesced() bool {
+	s.quiesceMu.Lock()
+	defer s.quiesceMu.Unlock()
+	if s.quiesceDepth == 0 {
+		return false
+	}
+	if time.Since(s.quiesceStart) >= maxGuestQuiesce {
+		// The pause outlived its budget, so stop trusting the accounting
+		// entirely rather than leaving a raised depth to poison later pauses.
+		s.quiesceDepth = 0
+		return false
+	}
+	return true
 }
 
 // ID returns the sandbox identifier string.
@@ -2028,7 +2075,14 @@ func (s *Sandbox) ResumeContainer(ctx context.Context, containerID string) error
 // PauseVM pauses the sandbox's VM.
 func (s *Sandbox) PauseVM(ctx context.Context) error {
 	s.Logger().Info("pause vm")
-	return s.hypervisor.PauseVM(ctx)
+	// mark before pausing: once the guest stops it can no longer answer the
+	// liveness monitor, and the monitor ticks independently of this call.
+	s.beginGuestQuiesce()
+	if err := s.hypervisor.PauseVM(ctx); err != nil {
+		s.endGuestQuiesce()
+		return err
+	}
+	return nil
 }
 
 // SaveVM saves the sandbox's VM state to the given destination directory.
@@ -2040,7 +2094,11 @@ func (s *Sandbox) SaveVM(destDir string) error {
 // ResumeVM resumes the sandbox's paused VM.
 func (s *Sandbox) ResumeVM(ctx context.Context) error {
 	s.Logger().Info("resume vm")
-	return s.hypervisor.ResumeVM(ctx)
+	if err := s.hypervisor.ResumeVM(ctx); err != nil {
+		return err
+	}
+	s.endGuestQuiesce()
+	return nil
 }
 
 // createContainers registers all containers, create the

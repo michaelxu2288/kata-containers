@@ -66,6 +66,15 @@ func (m *monitor) newWatcher(ctx context.Context) (chan error, error) {
 					m.wg.Done()
 					return
 				case <-tick.C:
+					// A guest that was deliberately paused (snapshot, container
+					// pause) cannot answer the agent, and that silence is not a
+					// fault. Reporting it here made the shim tear down healthy
+					// sandboxes mid-snapshot, because every watcher treats a
+					// monitor error as a dead sandbox.
+					if m.sandbox.guestQuiesced() {
+						monitorLog.Debug("guest intentionally paused; skipping liveness checks")
+						continue
+					}
 					m.watchHypervisor(ctx)
 					m.watchAgent(ctx)
 				}
@@ -77,6 +86,13 @@ func (m *monitor) newWatcher(ctx context.Context) (chan error, error) {
 }
 
 func (m *monitor) notify(ctx context.Context, err error) {
+	// A check that was already in flight when the guest was paused blocks until
+	// the guest runs again, so the flag has to be re-read here as well as
+	// before the check: watchers treat any report as a dead sandbox.
+	if m.sandbox.guestQuiesced() {
+		monitorLog.WithError(err).Debug("liveness check failed while the guest was intentionally paused; ignoring")
+		return
+	}
 	monitorLog.WithError(err).Warn("notify on errors")
 	m.sandbox.agent.markDead(ctx)
 
