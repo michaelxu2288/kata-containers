@@ -7,6 +7,8 @@ package virtcontainers
 
 import (
 	"context"
+	"errors"
+	"os"
 	"runtime"
 
 	deviceApi "github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
@@ -131,6 +133,16 @@ func CleanupContainer(ctx context.Context, sandboxID, containerID string, force 
 
 	unlock, err := rwLockSandbox(sandboxID)
 	if err != nil {
+		// Removing the sandbox's state directory is the last thing the primary
+		// delete path does, so finding it already gone means that path finished.
+		// There is nothing left to lock or tear down. Reporting an error here
+		// makes containerd's recovery helper exit non-zero for work that was
+		// already completed, and containerd then keeps the runtime bundle.
+		if force && errors.Is(err, os.ErrNotExist) {
+			virtLog.WithField("sandbox", sandboxID).
+				Info("sandbox state already removed; cleanup has nothing to do")
+			return nil
+		}
 		return err
 	}
 	defer unlock()

@@ -37,17 +37,20 @@ func cleanupContainer(ctx context.Context, sandboxID, cid, bundlePath string) er
 	err := vci.CleanupContainer(ctx, sandboxID, cid, true)
 	if err != nil {
 		shimLog.WithError(err).WithField("container", cid).Warn("failed to cleanup container")
-		return err
 	}
 
+	// The rootfs mount belongs to the host and is independent of any sandbox
+	// state, so unmount it whatever happened above. Returning early on a cleanup
+	// error left the mount behind for good: nothing runs this path twice.
 	rootfs := filepath.Join(bundlePath, "rootfs")
-
-	if err := mount.UnmountAll(rootfs, 0); err != nil {
-		shimLog.WithError(err).WithField("container", cid).Warn("failed to cleanup container rootfs")
-		return err
+	if uerr := mount.UnmountAll(rootfs, 0); uerr != nil {
+		shimLog.WithError(uerr).WithField("container", cid).Warn("failed to cleanup container rootfs")
+		if err == nil {
+			err = uerr
+		}
 	}
 
-	return nil
+	return err
 }
 
 func validBundle(containerID, bundlePath string) (string, error) {
