@@ -413,16 +413,49 @@ func (s *service) snapshotHandler(w http.ResponseWriter, r *http.Request) {
 // to destDir, copies the persist.json into destDir, writes a manifest, then
 // resumes the VM. the VM is always resumed (best-effort) even on failure so the
 // running pod is not left frozen.
+//
+// Only work that would observe a moving guest runs while the VM is paused: the
+// memory/state save and the copies of writable disks. Read-only image layers are
+// immutable, so they are packaged after the guest is running again. Keeping them
+// inside the pause made the frozen window scale with image size (a multi-GB agent
+// workload froze for ~41s), long enough for the liveness monitor to declare the
+// still-healthy source a dead agent and tear it down mid-snapshot.
 func (s *service) doSnapshot(ctx context.Context, destDir string) error {
 	if err := os.MkdirAll(destDir, 0700); err != nil {
 		return err
 	}
+	// Drop the markers that make a directory look like a finished snapshot
+	// before overwriting anything. If this run fails midway, what is left must
+	// not pass for complete: a half-written config.json can still name the
+	// source's live memory file, and restoring from that maps the running
+	// guest's RAM instead of a saved image.
+	for _, stale := range []string{"kata-snapshot.json", "persist.json"} {
+		if err := os.Remove(filepath.Join(destDir, stale)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("clear stale snapshot marker %s: %w", stale, err)
+		}
+	}
 
+	pauseStart := time.Now()
 	if err := s.sandbox.PauseVM(ctx); err != nil {
 		return err
 	}
-	// always try to resume so a partial failure never leaves the pod paused.
-	defer s.sandbox.ResumeVM(ctx)
+	resumed := false
+	var resumeErr error
+	resume := func() {
+		if resumed {
+			return
+		}
+		resumed = true
+		if err := s.sandbox.ResumeVM(ctx); err != nil {
+			// A snapshot that leaves the source frozen is a failure even if
+			// every artifact was written, so keep the error rather than only
+			// logging it: the caller must not be told the pod is healthy.
+			shimMgtLog.WithError(err).Error("snapshot: failed to resume the source VM")
+			resumeErr = fmt.Errorf("resume source vm after snapshot: %w", err)
+		}
+	}
+	// always try to resume so a partial failure never leaves the pod frozen.
+	defer resume()
 
 	// persist kata-level sandbox state to /run/vc/sbs/<id>/persist.json.
 	if err := s.sandbox.Save(); err != nil {
@@ -432,34 +465,70 @@ func (s *service) doSnapshot(ctx context.Context, destDir string) error {
 	if err := s.sandbox.SaveVM(destDir); err != nil {
 		return err
 	}
-	// Finalize config.json with snapshot-owned memory and EROFS disk paths. A
-	// restore copies this finalized config before applying per-VM changes.
-	if err := makeConfigSelfContained(destDir); err != nil {
-		return err
-	}
-	// bundle the persist.json into the snapshot dir alongside the memory/state files.
-	if err := s.copyPersistInto(destDir); err != nil {
-		return err
-	}
-	return s.writeSnapshotManifest(destDir)
-}
 
-// makeConfigSelfContained rewrites config.json to use snapshot-owned memory and
-// EROFS disk files. cloud-hypervisor otherwise records the live backing paths,
-// which disappear when containerd removes the source snapshots.
-func makeConfigSelfContained(destDir string) error {
-	configPath := filepath.Join(destDir, "config.json")
-	memoryRanges := filepath.Join(destDir, "memory-ranges")
-	raw, err := os.ReadFile(configPath)
+	cfg, err := readSnapshotConfig(destDir)
 	if err != nil {
 		return err
 	}
-	var cfg map[string]interface{}
-	if err := json.Unmarshal(raw, &cfg); err != nil {
+	// writable disks would diverge from the saved memory if the guest ran, so
+	// they must be copied before the resume.
+	writableChanged, err := packageErofsSnapshotDisks(destDir, cfg, writableDisks)
+	if err != nil {
 		return err
 	}
 
-	changed := false
+	// Bundle persist.json while the guest is still stopped. Almost every CRI
+	// call rewrites that file, so copying it after the resume can capture a
+	// container set that never existed in the saved memory -- a restore would
+	// then adopt a workload with no process behind it.
+	if err := s.copyPersistInto(destDir); err != nil {
+		return err
+	}
+
+	resume()
+	if resumeErr != nil {
+		return resumeErr
+	}
+	shimMgtLog.WithField("guest-paused-ms", time.Since(pauseStart).Milliseconds()).
+		Debug("snapshot: guest resumed; packaging read-only layers live")
+
+	// read-only layers cannot change under a running guest.
+	readOnlyChanged, err := packageErofsSnapshotDisks(destDir, cfg, readOnlyDisks)
+	if err != nil {
+		return err
+	}
+	// Finalize config.json with snapshot-owned memory and EROFS disk paths. A
+	// restore copies this finalized config before applying per-VM changes.
+	if err := finalizeSnapshotConfig(destDir, cfg, writableChanged || readOnlyChanged); err != nil {
+		return err
+	}
+	if err := s.writeSnapshotManifest(destDir); err != nil {
+		return err
+	}
+	return resumeErr
+}
+
+// readSnapshotConfig loads the cloud-hypervisor config.json written by SaveVM.
+func readSnapshotConfig(destDir string) (map[string]interface{}, error) {
+	raw, err := os.ReadFile(filepath.Join(destDir, "config.json"))
+	if err != nil {
+		return nil, err
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// finalizeSnapshotConfig rewrites config.json to use snapshot-owned memory and
+// EROFS disk files. cloud-hypervisor otherwise records the live backing paths,
+// which disappear when containerd removes the source snapshots.
+func finalizeSnapshotConfig(destDir string, cfg map[string]interface{}, disksChanged bool) error {
+	configPath := filepath.Join(destDir, "config.json")
+	memoryRanges := filepath.Join(destDir, "memory-ranges")
+
+	changed := disksChanged
 	if _, err := os.Stat(memoryRanges); err == nil {
 		if mem, ok := cfg["memory"].(map[string]interface{}); ok {
 			if zones, ok := mem["zones"].([]interface{}); ok {
@@ -475,11 +544,6 @@ func makeConfigSelfContained(destDir string) error {
 		return fmt.Errorf("stat snapshot memory file %s: %w", memoryRanges, err)
 	}
 
-	disksChanged, err := packageErofsSnapshotDisks(destDir, cfg)
-	if err != nil {
-		return err
-	}
-	changed = changed || disksChanged
 	if !changed {
 		return nil
 	}
@@ -491,7 +555,17 @@ func makeConfigSelfContained(destDir string) error {
 	return os.WriteFile(configPath, out, 0600)
 }
 
-func packageErofsSnapshotDisks(destDir string, cfg map[string]interface{}) (bool, error) {
+// diskPhase selects which disks a packaging pass copies.
+type diskPhase int
+
+const (
+	// writableDisks copies disks the guest can still write; must run while paused.
+	writableDisks diskPhase = iota
+	// readOnlyDisks copies immutable image layers; safe with the guest running.
+	readOnlyDisks
+)
+
+func packageErofsSnapshotDisks(destDir string, cfg map[string]interface{}, phase diskPhase) (bool, error) {
 	disks, ok := cfg["disks"].([]interface{})
 	if !ok {
 		return false, nil
@@ -515,12 +589,21 @@ func packageErofsSnapshotDisks(destDir string, cfg map[string]interface{}) (bool
 		// the first snapshot's files and the clone's ephemeral VM directory.
 		baseName := filepath.Base(sourcePath)
 		var role string
+		writable := false
 		switch {
 		case strings.HasSuffix(baseName, "layer.erofs"):
 			role = "layer.erofs"
 		case strings.HasSuffix(baseName, "rwlayer.img"):
 			role = "rwlayer.img"
+			writable = true
 		default:
+			continue
+		}
+		// trust an explicit readonly=false over the name
+		if ro, ok := disk["readonly"].(bool); ok && !ro {
+			writable = true
+		}
+		if (phase == writableDisks) != writable {
 			continue
 		}
 
