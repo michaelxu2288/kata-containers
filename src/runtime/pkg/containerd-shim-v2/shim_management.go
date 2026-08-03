@@ -413,6 +413,13 @@ func (s *service) snapshotHandler(w http.ResponseWriter, r *http.Request) {
 // to destDir, copies the persist.json into destDir, writes a manifest, then
 // resumes the VM. the VM is always resumed (best-effort) even on failure so the
 // running pod is not left frozen.
+//
+// Only work that would observe a moving guest runs while the VM is paused: the
+// memory/state save and the copies of writable disks. Read-only image layers are
+// immutable, so they are packaged after the guest is running again. Keeping them
+// inside the pause made the frozen window scale with image size (a multi-GB agent
+// workload froze for ~41s), long enough for the liveness monitor to declare the
+// still-healthy source a dead agent and tear it down mid-snapshot.
 func (s *service) doSnapshot(ctx context.Context, destDir string) error {
 	if err := os.MkdirAll(destDir, 0700); err != nil {
 		return err
@@ -421,8 +428,18 @@ func (s *service) doSnapshot(ctx context.Context, destDir string) error {
 	if err := s.sandbox.PauseVM(ctx); err != nil {
 		return err
 	}
-	// always try to resume so a partial failure never leaves the pod paused.
-	defer s.sandbox.ResumeVM(ctx)
+	resumed := false
+	resume := func() {
+		if resumed {
+			return
+		}
+		resumed = true
+		if err := s.sandbox.ResumeVM(ctx); err != nil {
+			shimMgtLog.WithError(err).Error("snapshot: failed to resume the source VM")
+		}
+	}
+	// always try to resume so a partial failure never leaves the pod frozen.
+	defer resume()
 
 	// persist kata-level sandbox state to /run/vc/sbs/<id>/persist.json.
 	if err := s.sandbox.Save(); err != nil {
@@ -432,9 +449,31 @@ func (s *service) doSnapshot(ctx context.Context, destDir string) error {
 	if err := s.sandbox.SaveVM(destDir); err != nil {
 		return err
 	}
+
+	cfg, err := readSnapshotConfig(destDir)
+	if err != nil {
+		return err
+	}
+	// writable disks would diverge from the saved memory if the guest ran, so
+	// they must be copied before the resume.
+	writableChanged, err := packageErofsSnapshotDisks(destDir, cfg, writableDisks)
+	if err != nil {
+		return err
+	}
+
+	pauseEnd := time.Now()
+	resume()
+	shimMgtLog.WithField("guest-paused-ms", time.Since(pauseEnd).Milliseconds()).
+		Debug("snapshot: guest resumed; packaging read-only layers live")
+
+	// read-only layers cannot change under a running guest.
+	readOnlyChanged, err := packageErofsSnapshotDisks(destDir, cfg, readOnlyDisks)
+	if err != nil {
+		return err
+	}
 	// Finalize config.json with snapshot-owned memory and EROFS disk paths. A
 	// restore copies this finalized config before applying per-VM changes.
-	if err := makeConfigSelfContained(destDir); err != nil {
+	if err := finalizeSnapshotConfig(destDir, cfg, writableChanged || readOnlyChanged); err != nil {
 		return err
 	}
 	// bundle the persist.json into the snapshot dir alongside the memory/state files.
@@ -444,22 +483,27 @@ func (s *service) doSnapshot(ctx context.Context, destDir string) error {
 	return s.writeSnapshotManifest(destDir)
 }
 
-// makeConfigSelfContained rewrites config.json to use snapshot-owned memory and
-// EROFS disk files. cloud-hypervisor otherwise records the live backing paths,
-// which disappear when containerd removes the source snapshots.
-func makeConfigSelfContained(destDir string) error {
-	configPath := filepath.Join(destDir, "config.json")
-	memoryRanges := filepath.Join(destDir, "memory-ranges")
-	raw, err := os.ReadFile(configPath)
+// readSnapshotConfig loads the cloud-hypervisor config.json written by SaveVM.
+func readSnapshotConfig(destDir string) (map[string]interface{}, error) {
+	raw, err := os.ReadFile(filepath.Join(destDir, "config.json"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var cfg map[string]interface{}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return err
+		return nil, err
 	}
+	return cfg, nil
+}
 
-	changed := false
+// finalizeSnapshotConfig rewrites config.json to use snapshot-owned memory and
+// EROFS disk files. cloud-hypervisor otherwise records the live backing paths,
+// which disappear when containerd removes the source snapshots.
+func finalizeSnapshotConfig(destDir string, cfg map[string]interface{}, disksChanged bool) error {
+	configPath := filepath.Join(destDir, "config.json")
+	memoryRanges := filepath.Join(destDir, "memory-ranges")
+
+	changed := disksChanged
 	if _, err := os.Stat(memoryRanges); err == nil {
 		if mem, ok := cfg["memory"].(map[string]interface{}); ok {
 			if zones, ok := mem["zones"].([]interface{}); ok {
@@ -475,11 +519,6 @@ func makeConfigSelfContained(destDir string) error {
 		return fmt.Errorf("stat snapshot memory file %s: %w", memoryRanges, err)
 	}
 
-	disksChanged, err := packageErofsSnapshotDisks(destDir, cfg)
-	if err != nil {
-		return err
-	}
-	changed = changed || disksChanged
 	if !changed {
 		return nil
 	}
@@ -491,7 +530,17 @@ func makeConfigSelfContained(destDir string) error {
 	return os.WriteFile(configPath, out, 0600)
 }
 
-func packageErofsSnapshotDisks(destDir string, cfg map[string]interface{}) (bool, error) {
+// diskPhase selects which disks a packaging pass copies.
+type diskPhase int
+
+const (
+	// writableDisks copies disks the guest can still write; must run while paused.
+	writableDisks diskPhase = iota
+	// readOnlyDisks copies immutable image layers; safe with the guest running.
+	readOnlyDisks
+)
+
+func packageErofsSnapshotDisks(destDir string, cfg map[string]interface{}, phase diskPhase) (bool, error) {
 	disks, ok := cfg["disks"].([]interface{})
 	if !ok {
 		return false, nil
@@ -515,12 +564,21 @@ func packageErofsSnapshotDisks(destDir string, cfg map[string]interface{}) (bool
 		// the first snapshot's files and the clone's ephemeral VM directory.
 		baseName := filepath.Base(sourcePath)
 		var role string
+		writable := false
 		switch {
 		case strings.HasSuffix(baseName, "layer.erofs"):
 			role = "layer.erofs"
 		case strings.HasSuffix(baseName, "rwlayer.img"):
 			role = "rwlayer.img"
+			writable = true
 		default:
+			continue
+		}
+		// trust an explicit readonly=false over the name
+		if ro, ok := disk["readonly"].(bool); ok && !ro {
+			writable = true
+		}
+		if (phase == writableDisks) != writable {
 			continue
 		}
 

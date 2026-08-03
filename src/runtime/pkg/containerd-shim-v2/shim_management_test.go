@@ -90,12 +90,22 @@ func TestMakeConfigSelfContainedPackagesErofsDisks(t *testing.T) {
 			map[string]interface{}{"id": "_disk4", "path": writableDisk},
 		},
 	}
-	configJSON, err := json.Marshal(config)
-	require.NoError(t, err)
+	configJSON, marshalErr := json.Marshal(config)
+	require.NoError(t, marshalErr)
 	configPath := filepath.Join(snapshotDir, "config.json")
 	require.NoError(t, os.WriteFile(configPath, configJSON, 0o600))
 
-	require.NoError(t, makeConfigSelfContained(snapshotDir))
+	// mirrors doSnapshot: writable disks are packaged while the guest is paused,
+	// read-only layers after it resumes, then the config is finalized once.
+	cfgMap, err := readSnapshotConfig(snapshotDir)
+	require.NoError(t, err)
+	writableChanged, err := packageErofsSnapshotDisks(snapshotDir, cfgMap, writableDisks)
+	require.NoError(t, err)
+	assert.True(t, writableChanged, "writable pass should package rwlayer.img")
+	readOnlyChanged, err := packageErofsSnapshotDisks(snapshotDir, cfgMap, readOnlyDisks)
+	require.NoError(t, err)
+	assert.True(t, readOnlyChanged, "read-only pass should package layer.erofs")
+	require.NoError(t, finalizeSnapshotConfig(snapshotDir, cfgMap, writableChanged || readOnlyChanged))
 
 	var restoredConfig struct {
 		Memory struct {
