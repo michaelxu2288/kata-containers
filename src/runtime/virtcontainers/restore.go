@@ -98,6 +98,17 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	sandboxConfig.NetworkConfig.NetworkID = opts.NetNSPath
 	sandboxConfig.NetworkConfig.NetworkCreated = false
 
+	// The OCI spec is deliberately not persisted (ContainerConfig.CustomSpec is
+	// `json:"-"`), so a config loaded from a snapshot carries none. Without it the
+	// sandbox derives an empty cgroup path and puts its shim and VMM in the
+	// runtime's default controller instead of the target pod's scope, which hides
+	// the clone from the kubelet's accounting. Reload the pause container's spec
+	// from the target bundle -- seedPersist has already pointed those annotations
+	// at the new sandbox -- before the resource controller is created.
+	if err := rehydratePauseSpec(sandboxConfig); err != nil {
+		return nil, err
+	}
+
 	s, err := createSandbox(ctx, *sandboxConfig, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create restored sandbox: %w", err)
@@ -334,6 +345,27 @@ func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 // private raw_flags bit for restore-only identity replacement; keep in sync with kata-agent.
 const kataIfaceRestoreReplace uint32 = 0x4000_0000
 
+// rehydratePauseSpec loads the target pod's OCI spec into the persisted pause
+// container config. The spec is what the sandbox derives its cgroup path from.
+func rehydratePauseSpec(cfg *SandboxConfig) error {
+	for i := range cfg.Containers {
+		cc := &cfg.Containers[i]
+		if cc.ID != cfg.ID {
+			continue
+		}
+		spec, err := compatoci.GetContainerSpec(cc.Annotations)
+		if err != nil {
+			return fmt.Errorf("kata restore failed: load target pause spec: %w", err)
+		}
+		if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
+			return fmt.Errorf("kata restore failed: target pause spec has no cgroups path")
+		}
+		cc.CustomSpec = &spec
+		return nil
+	}
+	return fmt.Errorf("kata restore failed: snapshot config has no pause container (id=%s)", cfg.ID)
+}
+
 // adoptPauseContainer rekeys host bookkeeping while preserving the pause process's guest ID.
 func adoptPauseContainer(s *Sandbox, origSandboxID string) error {
 	for i := range s.config.Containers {
@@ -341,11 +373,13 @@ func adoptPauseContainer(s *Sandbox, origSandboxID string) error {
 		if cc.ID != s.id {
 			continue
 		}
-		spec, err := compatoci.GetContainerSpec(cc.Annotations)
-		if err != nil {
-			return fmt.Errorf("get pause container spec: %w", err)
+		if cc.CustomSpec == nil {
+			spec, err := compatoci.GetContainerSpec(cc.Annotations)
+			if err != nil {
+				return fmt.Errorf("get pause container spec: %w", err)
+			}
+			cc.CustomSpec = &spec
 		}
-		cc.CustomSpec = &spec
 		c, err := newAdoptedContainer(s, cc)
 		if err != nil {
 			return fmt.Errorf("new pause container: %w", err)
