@@ -1552,6 +1552,17 @@ func (c *Container) create(ctx context.Context) (err error) {
 }
 
 func (c *Container) delete(ctx context.Context) error {
+	return c.deleteFromSandbox(ctx, true)
+}
+
+// deleteFromSandbox removes the container from its sandbox. storeState controls
+// whether the sandbox record is rewritten afterwards. A whole-sandbox delete
+// destroys the store at the end and must pass false: removeContainer drops the
+// container's state while the sandbox config still lists it, so persisting in
+// between leaves a config-without-state record on disk. Anything that later
+// reconstructs that sandbox -- a dead-shim cleanup helper, for instance --
+// rebuilds the container with a zero-value state it cannot transition out of.
+func (c *Container) deleteFromSandbox(ctx context.Context, storeState bool) error {
 	if c.state.State != types.StateReady &&
 		c.state.State != types.StateStopped {
 		return fmt.Errorf("Container not ready or stopped, impossible to delete")
@@ -1560,6 +1571,10 @@ func (c *Container) delete(ctx context.Context) error {
 	// Remove the container from sandbox structure
 	if err := c.sandbox.removeContainer(c.id); err != nil {
 		return err
+	}
+
+	if !storeState {
+		return nil
 	}
 
 	return c.sandbox.storeSandbox(ctx)

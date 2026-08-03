@@ -1145,7 +1145,10 @@ func (s *Sandbox) Delete(ctx context.Context) error {
 	}
 
 	for _, c := range s.containers {
-		if err := c.delete(ctx); err != nil {
+		// the whole store is destroyed below, so do not rewrite the sandbox
+		// record between containers; an interrupted delete would leave it
+		// listing a container whose state is already gone.
+		if err := c.deleteFromSandbox(ctx, false); err != nil {
 			s.Logger().WithError(err).WithField("container`", c.id).Debug("failed to delete container")
 		}
 	}
@@ -2822,6 +2825,25 @@ func (s *Sandbox) resourceControllerUpdate(ctx context.Context) error {
 
 // resourceControllerDelete will move the running processes in the sandbox resource
 // cvontroller to the parent and then delete the sandbox controller.
+// processInSystemdScope reports whether the calling process is a member of the
+// systemd scope described by a kata systemd cgroup path ("slice:prefix:name",
+// which names the unit "prefix-name.scope").
+func processInSystemdScope(cgroupPath string) bool {
+	parts := strings.Split(cgroupPath, ":")
+	if len(parts) != 3 || parts[1] == "" || parts[2] == "" {
+		return false
+	}
+	unit := parts[1] + "-" + parts[2] + ".scope"
+
+	self, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		// Fail closed: if membership cannot be established, keep the previous
+		// behaviour rather than silently leaking scopes.
+		return false
+	}
+	return strings.Contains(string(self), unit)
+}
+
 func (s *Sandbox) resourceControllerDelete() error {
 	s.Logger().Debugf("Deleting sandbox %s resource controler", s.sandboxController)
 	if s.state.SandboxCgroupPath == "" {
@@ -2848,7 +2870,18 @@ func (s *Sandbox) resourceControllerDelete() error {
 		}
 	}
 
-	if err := sandboxController.Delete(); err != nil {
+	// Deleting a systemd unit stops it, and stopping a unit terminates its
+	// members. When sandbox_cgroup_only puts this very process inside the
+	// sandbox scope, asking systemd to delete that scope kills the caller
+	// mid-teardown: Sandbox.Delete never reaches store.Destroy, the sandbox
+	// record is left behind, and containerd falls back to dead-shim recovery.
+	// An empty scope is released by systemd on its own once the last member
+	// exits, so skipping the call here costs nothing and the unit still goes
+	// away. A helper running outside the scope may still delete it explicitly.
+	if resCtrl.IsSystemdCgroup(s.state.SandboxCgroupPath) && processInSystemdScope(s.state.SandboxCgroupPath) {
+		s.Logger().WithField("scope", s.state.SandboxCgroupPath).
+			Info("not deleting the systemd scope this process belongs to; it is released on exit")
+	} else if err := sandboxController.Delete(); err != nil {
 		return err
 	}
 
