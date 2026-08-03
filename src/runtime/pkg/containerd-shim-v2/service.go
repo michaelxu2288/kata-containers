@@ -348,8 +348,27 @@ func getTopic(e interface{}) string {
 }
 
 // Cleanup is a binary call that cleans up resources used by the shim
+// cleanupBudget bounds one-shot cleanup. It sits under containerd's 5s
+// shim-cleanup timeout so the response can still be written before we are killed.
+const cleanupBudget = 4 * time.Second
+
 func (s *service) Cleanup(ctx context.Context) (_ *taskAPI.DeleteResponse, err error) {
-	span, spanCtx := katatrace.Trace(s.rootCtx, shimLog, "Cleanup", shimTracingTags)
+	// containerd runs this as a one-shot `shim delete` process and kills it after
+	// io.containerd.timeout.shim.cleanup (5s by default). That budget is enforced
+	// on the OS process, not carried in any context: the shim library starts the
+	// delete action from context.Background(). Starting from s.rootCtx as well
+	// left nothing in this path with a deadline, so cleanup would happily begin a
+	// 45s agent dial it could never finish, and containerd would kill it before it
+	// returned a DeleteResponse -- which is what strands the runtime-v2 bundle.
+	//
+	// Derive our own deadline so the work is bounded even when the caller's
+	// context has none, and keep a margin to serialize the response.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cleanupBudget)
+		defer cancel()
+	}
+	span, spanCtx := katatrace.Trace(ctx, shimLog, "Cleanup", shimTracingTags)
 	defer span.End()
 
 	//Since the binary cleanup will return the DeleteResponse from stdout to

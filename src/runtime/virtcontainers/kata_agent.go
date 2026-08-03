@@ -2389,6 +2389,24 @@ func (k *kataAgent) statsContainer(ctx context.Context, sandbox *Sandbox, c Cont
 	return containerStats, nil
 }
 
+// checkAgentEndpoint reports whether a hybrid-vsock agent endpoint still exists on
+// the host. A missing socket means the VMM is gone, so no amount of retrying will
+// produce a connection. Anything that is not a hybrid-vsock URL is left alone.
+func checkAgentEndpoint(url string) error {
+	if !strings.HasPrefix(url, kataclient.HybridVSockScheme+"://") {
+		return nil
+	}
+	// hvsock:///run/vc/vm/<id>/clh.sock:1024 -> /run/vc/vm/<id>/clh.sock
+	path := strings.TrimPrefix(url, kataclient.HybridVSockScheme+"://")
+	if idx := strings.LastIndex(path, ":"); idx > 0 {
+		path = path[:idx]
+	}
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("agent endpoint %s is unavailable: %w", path, err)
+	}
+	return nil
+}
+
 func (k *kataAgent) connect(ctx context.Context) error {
 	if k.dead {
 		return errors.New("Dead agent")
@@ -2408,8 +2426,25 @@ func (k *kataAgent) connect(ctx context.Context) error {
 		return nil
 	}
 
+	// Dial with the operation's context, not the sandbox's. The sandbox context
+	// outlives every request, so using it here let a caller working to a short
+	// deadline -- one-shot cleanup, with a few seconds before containerd kills it
+	// -- start a dial budgeted at dial_timeout (45s) and get killed mid-retry.
+	dialCtx := ctx
+	if dialCtx == nil {
+		dialCtx = k.ctx
+	}
+	// If the VMM endpoint is already gone there is nothing to reconnect to, and
+	// retrying until the dial budget expires only burns a caller's deadline that
+	// host-side cleanup still needs.
+	if err := checkAgentEndpoint(k.state.URL); err != nil {
+		k.Logger().WithError(err).WithField("url", k.state.URL).
+			Info("agent endpoint is gone; not dialing")
+		return err
+	}
+
 	k.Logger().WithField("url", k.state.URL).Info("New client")
-	client, err := kataclient.NewAgentClient(k.ctx, k.state.URL, k.dialTimout)
+	client, err := kataclient.NewAgentClient(dialCtx, k.state.URL, k.dialTimout)
 	if err != nil {
 		k.dead = true
 		return err

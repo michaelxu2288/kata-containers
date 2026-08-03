@@ -1508,7 +1508,15 @@ func (clh *cloudHypervisor) HotplugRemoveDevice(ctx context.Context, devInfo int
 			devInfo, devType)
 	}
 
+	// A sandbox reconstructed for cleanup never launched a VMM, so there is no
+	// API client to unplug against. Dereferencing it panicked the one-shot
+	// cleanup helper, which containerd then reports as a failed delete and which
+	// leaves the runtime bundle stranded. Forced cleanup tolerates a detach
+	// error, so report one instead of dying.
 	cl := clh.client()
+	if cl == nil {
+		return nil, fmt.Errorf("cannot hot remove device %s: no running VMM", deviceID)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), clhHotPlugAPITimeout*time.Second)
 	defer cancel()
 
