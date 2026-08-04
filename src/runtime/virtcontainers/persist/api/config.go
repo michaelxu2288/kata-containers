@@ -207,6 +207,7 @@ type HypervisorConfig struct {
 // to reach the Kata Containers agent.
 type KataAgentConfig struct {
 	LongLiveConn bool
+	DialTimeout  uint32
 }
 
 // ShimConfig is the structure providing specific configuration

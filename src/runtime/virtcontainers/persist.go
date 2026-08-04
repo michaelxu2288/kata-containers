@@ -257,6 +257,9 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 
 	ss.Config.KataAgentConfig = &persistapi.KataAgentConfig{
 		LongLiveConn: sconfig.AgentConfig.LongLiveConn,
+		// Without this a restored sandbox loses the configured dial_timeout and
+		// silently falls back to the client default.
+		DialTimeout: sconfig.AgentConfig.DialTimeout,
 	}
 
 	for _, contConf := range sconfig.Containers {
@@ -496,6 +499,7 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 
 	sconfig.AgentConfig = KataAgentConfig{
 		LongLiveConn: savedConf.KataAgentConfig.LongLiveConn,
+		DialTimeout:  savedConf.KataAgentConfig.DialTimeout,
 	}
 
 	for _, contConf := range savedConf.ContainerConfigs {

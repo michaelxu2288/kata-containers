@@ -9,6 +9,7 @@ package containerdshim
 import (
 	"context"
 	"fmt"
+	"github.com/containerd/containerd/api/types/task"
 	"os"
 	"path/filepath"
 	"time"
@@ -29,6 +30,41 @@ func cReap(s *service, status int, id, execid string, exitat time.Time) {
 		id:        id,
 		execid:    execid,
 	}
+}
+
+// abortRestoredSandbox terminates a restored sandbox whose activation failed, and
+// makes the failure visible to containerd.
+//
+// The runtime-side abort reaps the VM, but on its own that is not enough to let the
+// pod go away. A restored sandbox arms its pause task's waiter only once activation
+// succeeds, so a failure leaves no goroutine to notice the sandbox died. Nothing ever
+// publishes a task exit, StopPodSandbox blocks until its deadline, and the kubelet
+// retries forever -- the pod stays Terminating with a live shim behind it.
+//
+// Mark the pause task stopped and reap it here, which is what wait() would have done
+// had it been running.
+func abortRestoredSandbox(ctx context.Context, s *service, cause error) {
+	s.sandbox.AbortRestore(ctx, cause)
+
+	c := s.containers[s.id]
+	if c == nil || c.status == task.Status_STOPPED {
+		return
+	}
+	exitedAt := time.Now()
+	c.status = task.Status_STOPPED
+	c.exit = exitCode255
+	c.exitTime = exitedAt
+	shimLog.WithField("sandbox", s.id).Info("aborted restore: reaping the sandbox task")
+
+	// Wait() blocks on this channel and containerd's StopPodSandbox blocks on
+	// Wait(), so without a value here the stop never returns and the pod cannot
+	// be removed. The channel is buffered, and the select keeps this safe if a
+	// value is somehow already pending.
+	select {
+	case c.exitCh <- exitCode255:
+	default:
+	}
+	go cReap(s, int(exitCode255), c.id, "", exitedAt)
 }
 
 func cleanupContainer(ctx context.Context, sandboxID, cid, bundlePath string) error {

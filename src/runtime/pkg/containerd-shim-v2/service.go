@@ -867,6 +867,21 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 		return empty, nil
 	}
 
+	// Same reasoning one level up: if the sandbox itself is no longer running,
+	// nothing inside it can be either, so a kill is already satisfied. Without
+	// this the signal is forwarded to a dead sandbox, comes back as "Sandbox not
+	// running", and StopPodSandbox never converges -- the pod stays Terminating
+	// for as long as the kubelet keeps retrying.
+	if (signum == syscall.SIGKILL || signum == syscall.SIGTERM) &&
+		s.sandbox.Status().State.State != types.StateRunning {
+		shimLog.WithFields(logrus.Fields{
+			"sandbox":       s.sandbox.ID(),
+			"container":     c.id,
+			"sandbox-state": s.sandbox.Status().State.State,
+		}).Debug("sandbox is no longer running; treating kill as satisfied")
+		return empty, nil
+	}
+
 	return empty, s.sandbox.SignalProcess(spanCtx, c.id, processID, signum, r.All)
 }
 

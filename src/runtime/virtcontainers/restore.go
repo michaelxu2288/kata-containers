@@ -214,6 +214,40 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	return s, nil
 }
 
+// AbortRestore terminates a restored sandbox whose activation failed.
+//
+// A restore that fails after the VM is running leaves the worst possible state: the
+// workload is adopted and persisted, the guest is unreachable, and no monitor has been
+// installed yet because that happens only once activation succeeds. Nothing reaps the
+// VMM, and every later teardown step tries to talk to the agent, so StopPodSandbox
+// never converges and the pod is stuck Terminating for good.
+//
+// This is deliberately narrow. It acts on this sandbox's own hypervisor object and
+// nothing else -- no cgroup-wide kill, no sweep over processes that merely look
+// related. Marking the agent dead first means the teardown that follows does not spend
+// its budget dialing a guest that cannot answer.
+func (s *Sandbox) AbortRestore(ctx context.Context, cause error) {
+	s.Logger().WithError(cause).Warn("restore failed after the VM was restored; aborting this sandbox")
+
+	// The guest is unreachable: either still paused, or its agent is gone. Every
+	// subsequent step must stop asking it questions.
+	if s.agent != nil {
+		s.agent.markDead(ctx)
+	}
+
+	// Reap this sandbox's VMM. stopVM attempts a cooperative agent stop first,
+	// which is a no-op now that the agent is marked dead, and then stops the VM.
+	if err := s.stopVM(ctx); err != nil {
+		s.Logger().WithError(err).Error("abort restore: failed to stop the restored VM")
+	}
+
+	// Delete accepts only terminal states, and the pod must be deletable.
+	s.state.State = types.StateStopped
+	if err := s.Save(); err != nil {
+		s.Logger().WithError(err).Debug("abort restore: could not persist stopped state")
+	}
+}
+
 // FinalizeRestoreNetwork replaces guest identity before enabling TC redirects.
 func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 	// Keep forwarding closed on failure.

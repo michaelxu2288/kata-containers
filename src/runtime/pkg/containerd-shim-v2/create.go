@@ -261,6 +261,9 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 			}
 			contConfig.RootFs = rootFs
 			if _, err = s.sandbox.RestoreContainer(ctx, contConfig); err != nil {
+				// Adoption is the point of no return for a restored sandbox: the
+				// VM is already running and only this path can hand it a workload.
+				abortRestoredSandbox(ctx, s, err)
 				return nil, err
 			}
 			break

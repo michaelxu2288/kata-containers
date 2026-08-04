@@ -70,6 +70,9 @@ func startContainer(ctx context.Context, s *service, c *container) (retErr error
 		// identity; later workload starts find the guest already live.
 		if !s.restoreFinalized {
 			if err := s.sandbox.FinalizeRestoreNetwork(ctx); err != nil {
+				// The VM is up but unusable, and no monitor watches it yet.
+				// Leaving it running is what makes the pod unkillable.
+				abortRestoredSandbox(ctx, s, err)
 				return err
 			}
 			var err error
