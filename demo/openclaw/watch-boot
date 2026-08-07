@@ -1,0 +1,18 @@
+#!/bin/sh
+# RIGHT-PANE startup watcher. run this right after `k apply -f ~/sr0/agent.yaml`
+# on the LEFT. shows the container come up, then openclaw's verbose per-second
+# boot progress (the same log the postStart hook writes). auto-exits at READY.
+K=kubectl
+POD=${1:-agent}
+printf ">>> waiting for the %s container to start" "$POD"
+until $K get pod "$POD" -o jsonpath="{.status.containerStatuses[0].state.running.startedAt}" 2>/dev/null | grep -q T; do
+  printf "."; sleep 1
+done
+echo; echo ">>> container up. streaming openclaw startup (this is the cold-boot cost):"; echo
+$K exec "$POD" -- sh -c '
+  until [ -f /tmp/boot.log ]; do sleep 0.2; done
+  tail -n +1 -f /tmp/boot.log &
+  tp=$!
+  until grep -q "READY -" /tmp/boot.log 2>/dev/null; do sleep 0.3; done
+  sleep 0.6; kill $tp 2>/dev/null
+'

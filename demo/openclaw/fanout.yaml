@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fanout
+spec:
+  # ten agents from one snapshot; k apply + rollout status is the whole launch
+  replicas: 30
+  selector:
+    matchLabels:
+      app: fanout
+  template:
+    metadata:
+      annotations:
+        io.katacontainers.restore-from: "/run/vc/vm/snapshots/agent-v1"
+      labels:
+        app: fanout
+    spec:
+      nodeName: aks-nodepool1-48531884-vmss000000
+      runtimeClassName: kata-preview
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+      containers:
+      - name: openclaw
+        image: ghcr.io/openclaw/openclaw:2026.3.23
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        command: ["sleep","infinity"]
+        # the moment each replica wakes from the snapshot, it asks ITSELF and
+        # posts the answer to the chatroom under its own pod name
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - sh
+              - -c
+              - '(nohup openclaw-cli --ask "Which fruit is the best? Explain why in 2 sentences." --post "$HOSTNAME" >/tmp/wake.log 2>&1 &)'
+        # same readiness bar as the original: READY = the agent answers
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 18888
+          periodSeconds: 1
+        env:
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: anthropic-api-key
+              key: ANTHROPIC_API_KEY
+        - name: OPENCLAW_GATEWAY_TOKEN
+          value: "dummy-token-for-sandbox"
+        - name: OPENCLAW_CONFIG_PATH
+          value: "/etc/openclaw/openclaw.json"
+        ports:
+        - containerPort: 18789
+        - containerPort: 18888
+        volumeMounts:
+        - mountPath: /home/node/.openclaw
+          name: oc-state
+        - mountPath: /etc/openclaw
+          name: oc-config
+      volumes:
+      - name: oc-state
+        emptyDir: {}
+      - name: oc-config
+        configMap:
+          name: oc-anthropic-config

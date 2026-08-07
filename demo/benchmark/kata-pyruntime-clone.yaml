@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-pyruntime-clone
+  annotations:
+    # annotation flow: restore Harshit's original image from its snapshot as a networked pod.
+    # value is a BARE snapshot name under /run/vc/vm/snapshots/<name>. substitute at run time.
+    io.katacontainers.restore-from: "SNAPSHOT_NAME"
+spec:
+  runtimeClassName: kata
+  nodeSelector:
+    kubernetes.io/hostname: aks-nodepool1-23826427-vmss000000
+  containers:
+    - name: pyruntime
+      image: docker.io/harshitg/python-runtime:1
+      ports:
+        - containerPort: 8888

@@ -1,0 +1,21 @@
+#!/bin/sh
+# what a COLD start actually costs: the container exists, but openclaw does not
+# yet. runs invisibly from the pod's postStart hook; the readiness probe on
+# :18888 is what the audience actually watches. timestamps are real elapsed
+# (epoch-based), not loop counts.
+gw='require("http").get({host:"127.0.0.1",port:18789,path:"/"},r=>process.exit(0)).on("error",()=>process.exit(1))'
+api='require("http").get("http://127.0.0.1:18888/healthz",r=>process.exit(0)).on("error",()=>process.exit(1))'
+t0=$(date +%s)
+el() { echo $(( $(date +%s) - t0 )); }
+echo "container is up -- but the agent is not. openclaw still has to boot inside the VM:"
+echo "  node loads ~1300 ESM modules, builds the agent runtime, opens its gateway on :18789"
+printf '[%3ds] polling the openclaw gateway...\n' 0
+until node -e "$gw" 2>/dev/null; do
+  sleep 2
+  printf '[%3ds] not listening yet - openclaw is still loading\n' "$(el)"
+done
+printf '[%3ds] GATEWAY UP - openclaw finished booting\n' "$(el)"
+echo "        starting the little API server I use to talk to it..."
+(FRUIT_STAND_URL=${FRUIT_STAND_URL:-http://fruit-stand.default.svc.cluster.local} nohup node /demo/turn-http.mjs >/tmp/turn-http.log 2>&1 &)
+until node -e "$api" 2>/dev/null; do sleep 1; done
+printf '[%3ds] READY - this agent can finally answer a question\n' "$(el)"

@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-webcounter-clone
+  annotations:
+    io.katacontainers.restore-from: "SNAPSHOT_NAME"
+spec:
+  runtimeClassName: kata
+  nodeSelector:
+    kubernetes.io/hostname: aks-nodepool1-23826427-vmss000000
+  containers:
+    - name: webcounter
+      image: docker.io/library/python:3.12-slim
+      command: ["python", "-u", "-c"]
+      args:
+        - |
+          import http.server, socketserver, threading
+          c = [0]
+          def bump():
+              import time
+              while True:
+                  c[0] += 1
+                  time.sleep(1)
+          threading.Thread(target=bump, daemon=True).start()
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200); self.end_headers()
+                  self.wfile.write(("counter=%d\n" % c[0]).encode())
+              def log_message(self, *a, **k): pass
+          socketserver.TCPServer.allow_reuse_address = True
+          socketserver.TCPServer(("0.0.0.0", 9999), H).serve_forever()
+      ports:
+        - containerPort: 9999
