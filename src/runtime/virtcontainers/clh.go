@@ -655,8 +655,11 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 		}
 		// Enable hugepages if needed
 		clh.vmconfig.Memory.Hugepages = func(b bool) *bool { return &b }(clh.config.HugePages)
-		if !clh.config.ConfidentialGuest {
-			hotplugSize := clh.config.DefaultMaxMemorySize
+		// only reserve a hotplug region when maxmemory actually exceeds the boot
+		// size — on mshv, registering a host-ram-sized hotplug region costs ~1.2s
+		// per vm (map_user_memory ioctl scales with region size)
+		if !clh.config.ConfidentialGuest && clh.config.DefaultMaxMemorySize > uint64(clh.config.MemorySize) {
+			hotplugSize := clh.config.DefaultMaxMemorySize - uint64(clh.config.MemorySize)
 			// OpenAPI only supports int64 values
 			clh.vmconfig.Memory.HotplugSize = func(i int64) *int64 { return &i }(int64((utils.MemUnit(hotplugSize) * utils.MiB).ToBytes()))
 
