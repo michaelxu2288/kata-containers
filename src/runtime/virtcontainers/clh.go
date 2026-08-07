@@ -918,11 +918,13 @@ func (clh *cloudHypervisor) StartVM(ctx context.Context, timeout int) error {
 	defer span.End()
 
 	clh.Logger().WithField("function", "StartVM").Info("starting Sandbox")
+	ct := newPhaseTimer("COLDBOOT", clh.id, clh.Logger())
 
 	if err := clh.launchAndInit(ctx); err != nil {
 		return err
 	}
 
+	ct.phase("launchInit")
 	ctx, cancel := clh.bootTimeoutContext(ctx)
 	defer cancel()
 
@@ -930,6 +932,8 @@ func (clh *cloudHypervisor) StartVM(ctx context.Context, timeout int) error {
 		return err
 	}
 
+	ct.phase("kernelBoot")
+	ct.summary()
 	clh.state.state = clhReady
 	return nil
 }
@@ -943,6 +947,7 @@ func (clh *cloudHypervisor) RestoreVM(ctx context.Context, snapshotDir string) e
 	defer span.End()
 
 	clh.Logger().WithField("function", "RestoreVM").Info("restoring Sandbox")
+	vt := newPhaseTimer("VMBOOT", clh.id, clh.Logger())
 
 	defer func() {
 		for _, f := range clh.restoreNetFds {
@@ -958,10 +963,12 @@ func (clh *cloudHypervisor) RestoreVM(ctx context.Context, snapshotDir string) e
 		return err
 	}
 
+	vt.phase("launchInit")
 	if err := clh.prepareRestoreFiles(snapshotDir); err != nil {
 		return err
 	}
 
+	vt.phase("prepFiles")
 	ctx, cancel := clh.bootTimeoutContext(ctx)
 	defer cancel()
 
@@ -969,6 +976,8 @@ func (clh *cloudHypervisor) RestoreVM(ctx context.Context, snapshotDir string) e
 		return err
 	}
 
+	vt.phase("memFill")
+	vt.summary()
 	clh.state.state = clhReady
 	return nil
 }

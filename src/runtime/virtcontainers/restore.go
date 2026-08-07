@@ -30,6 +30,7 @@ type RestoreOpts struct {
 
 // RestoreSandbox restores a snapshot as a managed, paused sandbox.
 func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (_ *Sandbox, err error) {
+	rt := newPhaseTimer("RESTORE", opts.SandboxID, virtLog)
 	if _, statErr := os.Stat(filepath.Join(snapshotDir, "config.json")); statErr != nil {
 		return nil, fmt.Errorf("not a snapshot dir (no config.json): %s", snapshotDir)
 	}
@@ -88,6 +89,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	// Adopt the target CNI namespace without taking ownership of it.
 	sandboxConfig.NetworkConfig.NetworkID = opts.NetNSPath
 	sandboxConfig.NetworkConfig.NetworkCreated = false
+	rt.phase("config")
 
 	s, err := createSandbox(ctx, *sandboxConfig, nil)
 	if err != nil {
@@ -142,6 +144,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		return nil, err
 	}
 
+	rt.phase("netnsAdopt")
 	// Restore the existing guest NIC with the target TAP FDs while inside its netns.
 	vmConfig := VMConfig{
 		HypervisorType:      sandboxConfig.HypervisorType,
@@ -158,6 +161,7 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 	if err != nil {
 		return nil, fmt.Errorf("restore vm from snapshot: %w", err)
 	}
+	rt.phase("vmboot")
 	// Transfer cleanup ownership after assignSandbox succeeds.
 	vmAssigned := false
 	defer func() {
@@ -174,17 +178,21 @@ func RestoreSandbox(ctx context.Context, snapshotDir string, opts RestoreOpts) (
 		return nil, fmt.Errorf("assign restored vm to sandbox: %w", err)
 	}
 	vmAssigned = true
+	rt.phase("assign")
 
 	if err = adoptPauseContainer(s, origSandboxID); err != nil {
 		return nil, fmt.Errorf("adopt restored pause container: %w", err)
 	}
 
+	rt.phase("save")
+	rt.summary()
 	s.Logger().WithField("restored-sandbox", newID).Info("restore: managed sandbox restored paused")
 	return s, nil
 }
 
 // FinalizeRestoreNetwork replaces guest identity before enabling TC redirects.
 func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
+	nt := newPhaseTimer("NETWORK", s.id, virtLog)
 	// Keep forwarding closed on failure.
 	eps := s.network.Endpoints()
 	if len(eps) != 1 {
@@ -203,6 +211,7 @@ func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 		return fmt.Errorf("kata restore failed: resume: %w", err)
 	}
 
+	nt.phase("resume")
 	// The restored NIC still has the source identity, so select it by name.
 	before, lerr := s.agent.listInterfaces(ctx)
 	if lerr != nil {
@@ -221,6 +230,7 @@ func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 		return fmt.Errorf("kata restore failed: expected exactly one non-loopback guest NIC, found %d", guestNICCount)
 	}
 
+	nt.phase("ir_listBefore")
 	ifaces, routes, _, gerr := generateVCNetworkStructures(ctx, eps)
 	if gerr != nil {
 		return fmt.Errorf("kata restore failed: generate guest network structures: %w", gerr)
@@ -229,6 +239,7 @@ func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 		return fmt.Errorf("kata restore failed: expected exactly one target CNI interface, found %d", len(ifaces))
 	}
 
+	nt.phase("ir_genVC")
 	target := ifaces[0]
 	targetName := target.Name
 	target.Name = guestNICName
@@ -244,6 +255,7 @@ func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 		return fmt.Errorf("kata restore failed: restore-replace interface %s: %w", guestNICName, uerr)
 	}
 
+	nt.phase("identityReconcile")
 	for _, r := range routes {
 		if r.Device == targetName {
 			r.Device = guestNICName
@@ -255,6 +267,7 @@ func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 		}
 	}
 
+	nt.phase("routeInstall")
 	after, aerr := s.agent.listInterfaces(ctx)
 	if aerr != nil {
 		return fmt.Errorf("kata restore failed: read back guest interfaces: %w", aerr)
@@ -307,6 +320,7 @@ func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 		}
 	}
 
+	nt.phase("verify")
 	// Expose traffic only after identity verification.
 	if ferr := s.network.Run(ctx, func() error {
 		return activateRestoreTCFence(ctx, eps[0])
@@ -314,6 +328,7 @@ func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 		return fmt.Errorf("kata restore failed: activate network fence: %w", ferr)
 	}
 
+	nt.phase("activateFence")
 	idx, _, ierr := soleGuestWorkloadIndex(s)
 	if ierr != nil {
 		return fmt.Errorf("kata restore failed: locate adopted workload to mark running: %w", ierr)
@@ -325,6 +340,7 @@ func (s *Sandbox) FinalizeRestoreNetwork(ctx context.Context) (err error) {
 	if serr := c.setContainerState(types.StateRunning); serr != nil {
 		return fmt.Errorf("kata restore failed: mark adopted workload running: %w", serr)
 	}
+	nt.summary()
 	s.Logger().WithField("guest-nic", guestNICName).Info("restored network activated")
 	return nil
 }
